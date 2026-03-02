@@ -1,104 +1,109 @@
 use crate::data::{
-    AppSettings, BadgeEntry, BadgeEntryData, EventData, Holiday, HolidayData, QuarterConfig,
-    Vacation, VacationData,
+    AppSettings, BadgeEntry, BadgeEntryData, Event, EventData, Holiday, HolidayData, TimePeriod,
+    TimePeriodData, Vacation, VacationData,
 };
 use anyhow::Result;
-use chrono::NaiveDate;
-use serde::Serialize;
+use chrono::Local;
 use std::fs;
 use std::path::Path;
-
-/// Saves updated settings to config.yaml while preserving the existing quarters section.
-pub(crate) fn save_settings_to(settings: &AppSettings, dir: &Path) -> Result<()> {
-    use crate::data::persistence::Persistable;
-    // Load the existing quarters so we don't lose them
-    let quarter_data = crate::data::QuarterData::load_from(dir).unwrap_or_default();
-    let config = ConfigFile {
-        settings: settings.clone(),
-        quarters: quarter_data.quarters,
-    };
-    let yaml = serde_norway::to_string(&config)?;
-    fs::write(dir.join("config.yaml"), yaml)?;
-    Ok(())
-}
-
-/// Combined struct for serializing config.yaml in one pass.
-/// `QuarterData` and `SettingsWrapper` both read config.yaml independently,
-/// but writing them separately would overwrite each other — so we combine them here.
-#[derive(Serialize)]
-struct ConfigFile {
-    settings: AppSettings,
-    quarters: Vec<QuarterConfig>,
-}
 
 pub fn run() -> Result<()> {
     let dir = crate::data::persistence::get_data_dir()?;
     fs::create_dir_all(&dir)?;
     run_in_dir(&dir)?;
-    println!("Data files initialized successfully.");
+    println!("Initialized data files in: {}", dir.display());
     Ok(())
 }
 
-/// Writes all default data files into `dir`. Exposed for unit testing.
+/// Non-destructively writes default data files. Existing files are never overwritten.
 pub(crate) fn run_in_dir(dir: &Path) -> Result<()> {
-    write_config(dir)?;
-    write_badge_data(dir)?;
-    write_holidays(dir)?;
-    write_vacations(dir)?;
-    write_events(dir)?;
+    fs::create_dir_all(dir)?;
+
+    let settings = AppSettings::default();
+    if !file_exists(dir, "settings.yaml") {
+        settings.save_to(dir)?;
+    }
+
+    let tp_file = settings.active_time_period_file(0);
+    if !file_exists(dir, tp_file) {
+        let mut tp_data = TimePeriodData::new();
+        for tp in default_time_periods() {
+            tp_data.add(tp);
+        }
+        tp_data.save_to(dir)?;
+    }
+
+    if !file_exists(dir, "badge_data.json") {
+        let mut badge_data = BadgeEntryData::default();
+        badge_data.add(sample_badge_entry(&settings.default_office));
+        use crate::data::Persistable;
+        badge_data.save_to(dir)?;
+    }
+
+    if !file_exists(dir, "holidays.yaml") {
+        let mut holiday_data = HolidayData::default();
+        for h in default_holidays() {
+            holiday_data.add(h);
+        }
+        use crate::data::Persistable;
+        holiday_data.save_to(dir)?;
+    }
+
+    if !file_exists(dir, "vacations.yaml") {
+        let mut vacation_data = VacationData::default();
+        vacation_data.add(sample_vacation());
+        use crate::data::Persistable;
+        vacation_data.save_to(dir)?;
+    }
+
+    if !file_exists(dir, "events.json") {
+        let mut event_data = EventData::default();
+        event_data.add(sample_event());
+        use crate::data::Persistable;
+        event_data.save_to(dir)?;
+    }
+
     Ok(())
 }
 
-fn write_config(dir: &Path) -> Result<()> {
-    let config = ConfigFile {
-        settings: AppSettings::default(),
-        quarters: default_quarters(),
-    };
-    let yaml = serde_norway::to_string(&config)?;
-    fs::write(dir.join("config.yaml"), yaml)?;
-    Ok(())
+fn file_exists(dir: &Path, name: &str) -> bool {
+    dir.join(name).exists()
 }
 
-fn write_badge_data(dir: &Path) -> Result<()> {
-    let mut data = BadgeEntryData::default();
-    data.add(BadgeEntry::new(d(2025, 2, 13), "McLean, VA", false));
-    let json = serde_json::to_string_pretty(&data)?;
-    fs::write(dir.join("badge_data.json"), json)?;
-    Ok(())
+fn sample_badge_entry(office: &str) -> BadgeEntry {
+    let today = Local::now().date_naive();
+    BadgeEntry::new(today, office, false)
 }
 
-fn write_holidays(dir: &Path) -> Result<()> {
-    let mut data = HolidayData::default();
-    init_holidays(&mut data);
-    let yaml = serde_norway::to_string(&data)?;
-    fs::write(dir.join("holidays.yaml"), yaml)?;
-    Ok(())
+fn sample_vacation() -> Vacation {
+    Vacation::new("Vacation Destination", "2025-07-04", "2025-07-11", true)
 }
 
-fn write_vacations(dir: &Path) -> Result<()> {
-    let mut data = VacationData::default();
-    data.add(Vacation::new("Hawaii", "2025-05-10", "2025-05-17", true));
-    let yaml = serde_norway::to_string(&data)?;
-    fs::write(dir.join("vacations.yaml"), yaml)?;
-    Ok(())
+fn sample_event() -> Event {
+    let today = Local::now().date_naive();
+    Event {
+        date: today.format("%Y-%m-%d").to_string(),
+        description: "Sample event".to_string(),
+    }
 }
 
-fn write_events(dir: &Path) -> Result<()> {
-    let data = EventData::default();
-    let json = serde_json::to_string_pretty(&data)?;
-    fs::write(dir.join("events.json"), json)?;
-    Ok(())
+pub fn default_time_periods() -> Vec<TimePeriod> {
+    vec![
+        tp("Q1_2025", "Q1", "2025-01-01", "2025-03-31"),
+        tp("Q2_2025", "Q2", "2025-04-01", "2025-06-30"),
+        tp("Q3_2025", "Q3", "2025-07-01", "2025-09-30"),
+        tp("Q4_2025", "Q4", "2025-10-01", "2025-12-31"),
+        tp("Q1_2026", "Q1", "2026-01-01", "2026-03-31"),
+        tp("Q2_2026", "Q2", "2026-04-01", "2026-06-30"),
+        tp("Q3_2026", "Q3", "2026-07-01", "2026-09-30"),
+        tp("Q4_2026", "Q4", "2026-10-01", "2026-12-31"),
+    ]
 }
 
-fn d(y: i32, m: u32, day: u32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(y, m, day).unwrap()
-}
-
-fn q(key: &str, quarter: &str, year: &str, start: &str, end: &str) -> QuarterConfig {
-    QuarterConfig {
+fn tp(key: &str, name: &str, start: &str, end: &str) -> TimePeriod {
+    TimePeriod {
         key: key.to_string(),
-        quarter: quarter.to_string(),
-        year: year.to_string(),
+        name: name.to_string(),
         start_date_raw: start.to_string(),
         end_date_raw: end.to_string(),
         start_date: None,
@@ -106,53 +111,31 @@ fn q(key: &str, quarter: &str, year: &str, start: &str, end: &str) -> QuarterCon
     }
 }
 
-fn default_quarters() -> Vec<QuarterConfig> {
+pub fn default_holidays() -> Vec<Holiday> {
     vec![
-        q("Q1_2025", "Q1", "2025", "2025-02-01", "2025-04-30"),
-        q("Q2_2025", "Q2", "2025", "2025-05-01", "2025-07-31"),
-        q("Q3_2025", "Q3", "2025", "2025-08-01", "2025-10-31"),
-        q("Q4_2025", "Q4", "2025", "2025-11-01", "2026-01-31"),
-        q("Q1_2026", "Q1", "2026", "2026-02-01", "2026-04-30"),
-        q("Q2_2026", "Q2", "2026", "2026-05-01", "2026-07-31"),
-        q("Q3_2026", "Q3", "2026", "2026-08-01", "2026-10-31"),
-        q("Q4_2026", "Q4", "2026", "2026-11-01", "2027-01-31"),
+        Holiday::new("New Year's Day", "2025-01-01"),
+        Holiday::new("MLK Day", "2025-01-20"),
+        Holiday::new("Presidents' Day", "2025-02-17"),
+        Holiday::new("Memorial Day", "2025-05-26"),
+        Holiday::new("Juneteenth", "2025-06-19"),
+        Holiday::new("Independence Day", "2025-07-04"),
+        Holiday::new("Labor Day", "2025-09-01"),
+        Holiday::new("Columbus Day", "2025-10-13"),
+        Holiday::new("Veterans Day", "2025-11-11"),
+        Holiday::new("Thanksgiving Day", "2025-11-27"),
+        Holiday::new("Christmas Day", "2025-12-25"),
+        Holiday::new("New Year's Day", "2026-01-01"),
+        Holiday::new("MLK Day", "2026-01-19"),
+        Holiday::new("Presidents' Day", "2026-02-16"),
+        Holiday::new("Memorial Day", "2026-05-25"),
+        Holiday::new("Juneteenth", "2026-06-19"),
+        Holiday::new("Independence Day (observed)", "2026-07-03"),
+        Holiday::new("Labor Day", "2026-09-07"),
+        Holiday::new("Columbus Day", "2026-10-12"),
+        Holiday::new("Veterans Day", "2026-11-11"),
+        Holiday::new("Thanksgiving Day", "2026-11-26"),
+        Holiday::new("Christmas Day", "2026-12-25"),
     ]
-}
-
-fn init_holidays(data: &mut HolidayData) {
-    data.add(Holiday::new("New Year's Day", "2025-01-01"));
-    data.add(Holiday::new("Martin Luther King Jr. Day", "2025-01-20"));
-    data.add(Holiday::new("Presidents' Day", "2025-02-17"));
-    data.add(Holiday::new("Thank You Day #1", "2025-03-14"));
-    data.add(Holiday::new("Thank You Day #2", "2025-05-23"));
-    data.add(Holiday::new("Memorial Day", "2025-05-26"));
-    data.add(Holiday::new("Juneteenth", "2025-06-19"));
-    data.add(Holiday::new("Thank You Day #3", "2025-06-20"));
-    data.add(Holiday::new("Independence Day", "2025-07-04"));
-    data.add(Holiday::new("Thank You Day #4", "2025-08-29"));
-    data.add(Holiday::new("Labor Day", "2025-09-01"));
-    data.add(Holiday::new("Veterans Day", "2025-11-11"));
-    data.add(Holiday::new("Thanksgiving Day", "2025-11-27"));
-    data.add(Holiday::new("Thanksgiving Day After", "2025-11-28"));
-    data.add(Holiday::new("Christmas Eve", "2025-12-24"));
-    data.add(Holiday::new("Christmas Day", "2025-12-25"));
-
-    data.add(Holiday::new("New Year's Day", "2026-01-01"));
-    data.add(Holiday::new("Martin Luther King Jr. Day", "2026-01-19"));
-    data.add(Holiday::new("Presidents' Day", "2026-02-16"));
-    data.add(Holiday::new("Thank You Day #1", "2026-03-27"));
-    data.add(Holiday::new("Thank You Day #2", "2026-05-22"));
-    data.add(Holiday::new("Memorial Day", "2026-05-25"));
-    data.add(Holiday::new("Thank You Day #3", "2026-06-18"));
-    data.add(Holiday::new("Juneteenth", "2026-06-19"));
-    data.add(Holiday::new("Independence Day", "2026-07-03"));
-    data.add(Holiday::new("Thank You Day #4", "2026-09-04"));
-    data.add(Holiday::new("Labor Day", "2026-09-07"));
-    data.add(Holiday::new("Veterans Day", "2026-11-11"));
-    data.add(Holiday::new("Thanksgiving Day", "2026-11-26"));
-    data.add(Holiday::new("Thanksgiving Day After", "2026-11-27"));
-    data.add(Holiday::new("Christmas Eve", "2026-12-24"));
-    data.add(Holiday::new("Christmas Day", "2026-12-25"));
 }
 
 #[cfg(test)]
@@ -164,114 +147,92 @@ mod tests {
     fn test_run_in_dir_creates_all_files() {
         let tmp = TempDir::new().unwrap();
         run_in_dir(tmp.path()).unwrap();
-        assert!(tmp.path().join("config.yaml").exists(), "config.yaml missing");
+        assert!(tmp.path().join("settings.yaml").exists());
+        assert!(tmp.path().join("badge_data.json").exists());
+        assert!(tmp.path().join("holidays.yaml").exists());
+        assert!(tmp.path().join("vacations.yaml").exists());
+        assert!(tmp.path().join("events.json").exists());
+        assert!(tmp.path().join("workday-fiscal-quarters.yaml").exists());
+    }
+
+    #[test]
+    fn test_non_destructive_does_not_overwrite() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("settings.yaml"), "custom: true").unwrap();
+        run_in_dir(tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("settings.yaml")).unwrap();
         assert!(
-            tmp.path().join("badge_data.json").exists(),
-            "badge_data.json missing"
-        );
-        assert!(
-            tmp.path().join("holidays.yaml").exists(),
-            "holidays.yaml missing"
-        );
-        assert!(
-            tmp.path().join("vacations.yaml").exists(),
-            "vacations.yaml missing"
-        );
-        assert!(
-            tmp.path().join("events.json").exists(),
-            "events.json missing"
+            content.contains("custom: true"),
+            "existing file should not be overwritten"
         );
     }
 
     #[test]
-    fn test_events_file_is_empty_array() {
+    fn test_events_file_has_sample() {
         let tmp = TempDir::new().unwrap();
-        write_events(tmp.path()).unwrap();
+        run_in_dir(tmp.path()).unwrap();
         let content = fs::read_to_string(tmp.path().join("events.json")).unwrap();
         let data: EventData = serde_json::from_str(&content).unwrap();
-        assert!(data.events.is_empty(), "events should be empty on init");
+        assert_eq!(data.len(), 1);
     }
 
     #[test]
-    fn test_config_yaml_contains_settings_and_quarters() {
+    fn test_settings_yaml_is_parseable() {
         let tmp = TempDir::new().unwrap();
-        write_config(tmp.path()).unwrap();
-        let content = fs::read_to_string(tmp.path().join("config.yaml")).unwrap();
-        assert!(content.contains("settings"), "config.yaml missing 'settings' key");
-        assert!(content.contains("quarters"), "config.yaml missing 'quarters' key");
-        assert!(content.contains("Q1_2025"), "config.yaml missing Q1_2025");
-        assert!(content.contains("Q4_2026"), "config.yaml missing Q4_2026");
-        assert!(content.contains("default_office"), "config.yaml missing 'default_office'");
+        run_in_dir(tmp.path()).unwrap();
+        let loaded = AppSettings::load_from(tmp.path()).unwrap();
+        assert_eq!(loaded.default_office, "McLean, VA");
+        assert_eq!(loaded.goal, 50);
+        assert!(!loaded.time_periods.is_empty());
     }
 
     #[test]
-    fn test_config_yaml_is_parseable_as_quarter_data() {
-        use crate::data::QuarterData;
+    fn test_time_period_file_is_parseable() {
         let tmp = TempDir::new().unwrap();
-        write_config(tmp.path()).unwrap();
-        let content = fs::read_to_string(tmp.path().join("config.yaml")).unwrap();
-        let qdata: QuarterData = serde_norway::from_str(&content).unwrap();
-        assert_eq!(qdata.quarters.len(), 8, "expected 8 quarters");
-        assert_eq!(qdata.quarters[0].key, "Q1_2025");
+        run_in_dir(tmp.path()).unwrap();
+        let loaded = TimePeriodData::load_from(tmp.path(), "workday-fiscal-quarters.yaml").unwrap();
+        assert_eq!(loaded.len(), 8);
     }
 
     #[test]
-    fn test_config_yaml_is_parseable_as_settings() {
+    fn test_badge_data_has_one_entry() {
         let tmp = TempDir::new().unwrap();
-        write_config(tmp.path()).unwrap();
-        let content = fs::read_to_string(tmp.path().join("config.yaml")).unwrap();
-        // Parse the settings section via serde_norway
-        #[derive(serde::Deserialize)]
-        struct Wrapper {
-            settings: AppSettings,
-        }
-        let w: Wrapper = serde_norway::from_str(&content).unwrap();
-        assert_eq!(w.settings.default_office, "McLean, VA");
-        assert_eq!(w.settings.flex_credit, "Flex Credit");
-    }
-
-    #[test]
-    fn test_badge_data_file_has_one_entry() {
-        let tmp = TempDir::new().unwrap();
-        write_badge_data(tmp.path()).unwrap();
+        run_in_dir(tmp.path()).unwrap();
         let content = fs::read_to_string(tmp.path().join("badge_data.json")).unwrap();
         let data: BadgeEntryData = serde_json::from_str(&content).unwrap();
-        assert_eq!(data.data.len(), 1);
-        assert_eq!(data.data[0].key, "2025-02-13");
-        assert_eq!(data.data[0].office, "McLean, VA");
+        assert_eq!(data.len(), 1);
     }
 
     #[test]
     fn test_holidays_file_has_expected_count() {
         let tmp = TempDir::new().unwrap();
-        write_holidays(tmp.path()).unwrap();
+        run_in_dir(tmp.path()).unwrap();
         let content = fs::read_to_string(tmp.path().join("holidays.yaml")).unwrap();
         let data: HolidayData = serde_norway::from_str(&content).unwrap();
-        assert_eq!(data.holidays.len(), 32, "expected 32 holidays");
+        assert_eq!(data.len(), 22);
     }
 
     #[test]
     fn test_vacations_file_has_one_entry() {
         let tmp = TempDir::new().unwrap();
-        write_vacations(tmp.path()).unwrap();
+        run_in_dir(tmp.path()).unwrap();
         let content = fs::read_to_string(tmp.path().join("vacations.yaml")).unwrap();
         let data: VacationData = serde_norway::from_str(&content).unwrap();
-        assert_eq!(data.vacations.len(), 1);
-        assert_eq!(data.vacations[0].destination, "Hawaii");
+        assert_eq!(data.len(), 1);
     }
 
     #[test]
-    fn test_default_quarters_count() {
-        let quarters = default_quarters();
-        assert_eq!(quarters.len(), 8);
+    fn test_default_time_periods_count() {
+        let periods = default_time_periods();
+        assert_eq!(periods.len(), 8);
     }
 
     #[test]
-    fn test_default_quarters_dates_parseable() {
-        for mut q in default_quarters() {
-            q.parse_dates().expect("quarter dates should be valid");
-            assert!(q.start_date.is_some());
-            assert!(q.end_date.is_some());
+    fn test_default_time_periods_parseable() {
+        for mut tp in default_time_periods() {
+            tp.parse_dates().expect("time period dates should be valid");
+            assert!(tp.start_date.is_some());
+            assert!(tp.end_date.is_some());
         }
     }
 }

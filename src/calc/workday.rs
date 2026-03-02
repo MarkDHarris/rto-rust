@@ -4,7 +4,9 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, Default)]
 pub struct Workday {
     pub date: NaiveDate,
+    #[allow(dead_code)]
     pub work_date: String,
+    #[allow(dead_code)]
     pub is_workday: bool,
     pub is_badged_in: bool,
     pub is_flex_credit: bool,

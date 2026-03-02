@@ -7,14 +7,22 @@ pub fn run() -> Result<()> {
 }
 
 pub(crate) fn write_holidays<W: std::io::Write>(data: &HolidayData, out: &mut W) -> Result<()> {
-    writeln!(out, "Holidays")?;
-    writeln!(out, "---")?;
-    writeln!(out, "  {:<14} {}", "Date", "Name")?;
-    for h in &data.holidays {
-        writeln!(out, "  {:<14} {}", h.date, h.name)?;
+    let all = data.all();
+    if all.is_empty() {
+        writeln!(out, "No holidays recorded.")?;
+        return Ok(());
     }
-    writeln!(out, "---")?;
-    writeln!(out, "Total: {} holiday(s)", data.holidays.len())?;
+
+    writeln!(out, "{:<12}  Name", "Date")?;
+    writeln!(
+        out,
+        "{:<12}  ------------------------------",
+        "------------"
+    )?;
+
+    for h in &all {
+        writeln!(out, "{:<12}  {}", h.date, h.name)?;
+    }
     Ok(())
 }
 
@@ -33,7 +41,7 @@ mod tests {
         let mut buf = Vec::new();
         write_holidays(&data, &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("Total: 0 holiday(s)"));
+        assert!(out.contains("No holidays recorded"));
     }
 
     #[test]
@@ -44,7 +52,6 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("New Year's Day"));
         assert!(out.contains("2025-01-01"));
-        assert!(out.contains("Total: 1 holiday(s)"));
     }
 
     #[test]
@@ -56,7 +63,6 @@ mod tests {
         let mut buf = Vec::new();
         write_holidays(&data, &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("Total: 2 holiday(s)"));
         assert!(out.contains("Independence Day"));
     }
 

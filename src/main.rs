@@ -7,10 +7,10 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "rustrto", about = "return to office")]
+#[command(name = "rto", about = "Return-to-Office tracker")]
 struct Cli {
-    /// Path to the data directory containing config and data files (default: ./config)
-    #[arg(long, default_value = "./config")]
+    /// Path to the data directory (default: ./config)
+    #[arg(short = 'd', long, default_value = "./config")]
     data_dir: PathBuf,
 
     #[command(subcommand)]
@@ -19,21 +19,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize data files from config
+    /// Initialize data files with defaults
     Init,
-    /// Calculate and display RTO statistics for a specific quarter
+    /// Print statistics for a time period
     Stats {
-        /// Quarter key (e.g. Q1_2025)
-        quarter_key: String,
+        /// Period key (e.g. Q1_2025). Uses the current period if not specified.
+        period_key: Option<String>,
     },
-    /// Backup data files to a git repository
+    /// Backup data directory to git
     Backup {
         /// Remote Git URL to push to
         #[arg(short, long)]
         remote: Option<String>,
-        /// The directory containing the data to backup
-        #[arg(short = 'd', long, default_value = ".")]
-        target_dir: String,
+        /// The directory to backup (default: data-dir)
+        #[arg(long)]
+        dir: Option<String>,
     },
     /// List all vacations
     Vacations,
@@ -44,8 +44,6 @@ enum Commands {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Resolve data_dir to an absolute path so git -C <dir> and file I/O work
-    // regardless of future directory changes within the process.
     let data_dir = if cli.data_dir.is_absolute() {
         cli.data_dir.clone()
     } else {
@@ -53,37 +51,36 @@ fn main() -> anyhow::Result<()> {
     };
     data::persistence::set_data_dir(data_dir.clone());
 
-    // Auto-init when the data directory is missing or empty and the user did not
-    // explicitly invoke the `init` subcommand.
     let is_init_command = matches!(cli.command, Some(Commands::Init));
     if !is_init_command && dir_needs_init(&data_dir) {
-        eprintln!(
-            "Data directory '{}' is missing or empty — running init...",
-            data_dir.display()
-        );
+        eprintln!("Data directory not initialized. Running 'rto init'...",);
         cmd::init::run()?;
     }
 
     match cli.command {
         None => cmd::root::run(),
         Some(Commands::Init) => cmd::init::run(),
-        Some(Commands::Stats { quarter_key }) => cmd::stats::run(&quarter_key),
-        Some(Commands::Backup { remote, target_dir }) => {
-            cmd::backup::run(remote.as_deref(), &target_dir)
+        Some(Commands::Stats { period_key }) => cmd::stats::run(period_key.as_deref()),
+        Some(Commands::Backup { remote, dir }) => {
+            let target = dir.unwrap_or_else(|| data_dir.to_string_lossy().to_string());
+            cmd::backup::run(remote.as_deref(), &target)
         }
         Some(Commands::Vacations) => cmd::vacations::run(),
         Some(Commands::Holidays) => cmd::holidays::run(),
     }
 }
 
-/// Returns true when `dir` does not exist or exists but contains no files.
+/// Returns true when the data directory has never been initialized.
+/// Checks for settings.yaml as the canonical marker of initialization.
 fn dir_needs_init(dir: &std::path::Path) -> bool {
     if !dir.exists() {
         return true;
     }
-    dir.read_dir()
-        .map(|mut entries| entries.next().is_none())
-        .unwrap_or(false)
+    if !dir.is_dir() {
+        return true;
+    }
+    let settings_path = dir.join("settings.yaml");
+    !settings_path.exists()
 }
 
 #[cfg(test)]
@@ -106,9 +103,16 @@ mod tests {
     }
 
     #[test]
-    fn test_dir_needs_init_nonempty_dir() {
+    fn test_dir_needs_init_nonempty_dir_without_settings() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("file.txt"), "data").unwrap();
+        assert!(dir_needs_init(tmp.path()));
+    }
+
+    #[test]
+    fn test_dir_needs_init_with_settings() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("settings.yaml"), "goal: 50").unwrap();
         assert!(!dir_needs_init(tmp.path()));
     }
 }

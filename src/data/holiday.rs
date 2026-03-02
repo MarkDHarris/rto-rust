@@ -1,5 +1,6 @@
 use crate::data::persistence::Persistable;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Holiday {
@@ -16,7 +17,7 @@ impl Holiday {
     }
 }
 
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct HolidayData {
     pub holidays: Vec<Holiday>,
 }
@@ -35,8 +36,22 @@ impl HolidayData {
         self.holidays.push(holiday);
     }
 
-    pub fn get_holiday_map(&self) -> std::collections::HashMap<String, &Holiday> {
-        let mut map = std::collections::HashMap::new();
+    pub fn all(&self) -> Vec<Holiday> {
+        self.holidays.clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.holidays.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.holidays.is_empty()
+    }
+
+    pub fn get_holiday_map(&self) -> HashMap<String, &Holiday> {
+        let mut map = HashMap::new();
         for h in &self.holidays {
             map.insert(h.date.clone(), h);
         }
@@ -59,7 +74,7 @@ mod tests {
     fn test_add_inserts_holiday() {
         let mut data = HolidayData::default();
         data.add(Holiday::new("Test Holiday", "2025-07-04"));
-        assert_eq!(data.holidays.len(), 1);
+        assert_eq!(data.len(), 1);
     }
 
     #[test]
@@ -67,7 +82,15 @@ mod tests {
         let mut data = HolidayData::default();
         data.add(Holiday::new("Holiday A", "2025-01-01"));
         data.add(Holiday::new("Holiday B", "2025-07-04"));
-        assert_eq!(data.holidays.len(), 2);
+        assert_eq!(data.len(), 2);
+    }
+
+    #[test]
+    fn test_all_returns_copy() {
+        let mut data = HolidayData::default();
+        data.add(Holiday::new("Test", "2025-01-01"));
+        let all = data.all();
+        assert_eq!(all.len(), 1);
     }
 
     #[test]
@@ -91,6 +114,6 @@ mod tests {
     #[test]
     fn test_default_holiday_data_is_empty() {
         let data = HolidayData::default();
-        assert!(data.holidays.is_empty());
+        assert!(data.is_empty());
     }
 }

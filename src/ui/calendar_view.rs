@@ -1,18 +1,18 @@
-use crate::calc::{calculate_quarter_stats, QuarterStats};
+use crate::calc::{QuarterStats, calculate_quarter_stats, calculate_year_stats};
 use crate::data::{
-    AppSettings, BadgeEntry, BadgeEntryData, Event, EventData, HolidayData, QuarterConfig,
-    QuarterData, VacationData,
+    AppSettings, BadgeEntry, BadgeEntryData, Event, EventData, Holiday, HolidayData, TimePeriod,
+    TimePeriodData, Vacation, VacationData,
 };
 use anyhow::Result;
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyModifiers};
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
-    Frame, Terminal,
 };
 use std::io::Stdout;
 use std::path::PathBuf;
@@ -43,47 +43,40 @@ enum ViewState {
 }
 
 pub struct App<'a> {
-    quarter_data: &'a QuarterData,
+    time_period_data: TimePeriodData,
     badge_data: &'a mut BadgeEntryData,
     holiday_data: &'a mut HolidayData,
     vacation_data: &'a mut VacationData,
     event_data: &'a mut EventData,
-    current_quarter: Option<&'a QuarterConfig>,
     selected_date: NaiveDate,
     today: NaiveDate,
-    /// Tracks the navigation position used by n/p. Updated on every n/p press
-    /// even when current_quarter is None, so the user can always navigate back.
     nav_date: NaiveDate,
     mode: Mode,
     input_buffer: String,
     cursor_index: usize,
-    quarter_stats: Option<QuarterStats>,
-    /// Year-level aggregate stats spanning Q1 start → Q4 end for the viewed year.
+    active_stats: Option<QuarterStats>,
     year_stats: Option<QuarterStats>,
     table_state: TableState,
     pub settings: AppSettings,
-    /// When Some, the app is in what-if mode. Holds the original badge data
-    /// so it can be restored when exiting the mode.
     what_if_snapshot: Option<BadgeEntryData>,
-    /// Absolute path to the data directory, used for git backup.
     data_dir: PathBuf,
-    /// Result of the last git backup (message, color). Cleared on next keypress.
+    active_time_period_idx: usize,
     git_status: Option<(String, Color)>,
-    /// Which top-level view is active.
     view_state: ViewState,
-    /// Selected row in vacation/holiday list view.
     list_cursor: usize,
-    /// 0 = browsing; 1–N = entering add/edit field N.
     list_add_stage: u8,
-    /// Completed fields during a multi-stage add/edit operation.
     list_field_bufs: Vec<String>,
-    /// When Some, we are editing the item at this index rather than adding a new one.
     list_edit_index: Option<usize>,
 }
 
 impl<'a> App<'a> {
+    fn current_period(&self) -> Option<&TimePeriod> {
+        self.time_period_data.get_period_by_date(self.nav_date)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        quarter_data: &'a QuarterData,
+        time_period_data: TimePeriodData,
         badge_data: &'a mut BadgeEntryData,
         holiday_data: &'a mut HolidayData,
         vacation_data: &'a mut VacationData,
@@ -92,32 +85,28 @@ impl<'a> App<'a> {
         today: NaiveDate,
         data_dir: PathBuf,
     ) -> Self {
-        let current_quarter = quarter_data.get_quarter_by_date(today);
+        let period = time_period_data.get_period_by_date(today);
         let selected_date = today;
-        // Initialise nav_date to the start of the current quarter so that the
-        // first n/p press moves exactly one quarter forward/backward.
-        let nav_date = current_quarter
-            .and_then(|q| q.start_date)
-            .unwrap_or(today);
+        let nav_date = period.and_then(|q| q.start_date).unwrap_or(today);
         let mut app = App {
-            quarter_data,
+            time_period_data,
             badge_data,
             holiday_data,
             vacation_data,
             event_data,
-            current_quarter,
             selected_date,
             today,
             nav_date,
             mode: Mode::Normal,
             input_buffer: String::new(),
             cursor_index: 0,
-            quarter_stats: None,
+            active_stats: None,
             year_stats: None,
             table_state: TableState::default(),
             settings,
             what_if_snapshot: None,
             data_dir,
+            active_time_period_idx: 0,
             git_status: None,
             view_state: ViewState::Calendar,
             list_cursor: 0,
@@ -130,79 +119,110 @@ impl<'a> App<'a> {
     }
 
     fn update_stats(&mut self) {
-        if let Some(q) = self.current_quarter {
+        if let Some(q) = self.current_period() {
             match calculate_quarter_stats(
                 q,
                 self.badge_data,
                 self.holiday_data,
                 self.vacation_data,
+                self.settings.goal,
                 None,
             ) {
-                Ok(stats) => self.quarter_stats = Some(stats),
+                Ok(stats) => self.active_stats = Some(stats),
                 Err(e) => {
-                    self.quarter_stats = None;
+                    self.active_stats = None;
                     eprintln!("Error calculating stats: {e}");
                 }
             }
         } else {
-            self.quarter_stats = None;
+            self.active_stats = None;
         }
         self.update_year_stats();
     }
 
     fn update_year_stats(&mut self) {
-        let year_str = match self.current_quarter {
-            Some(q) => q.year.clone(),
+        let year = match self.current_period() {
+            Some(q) => q.start_date.map(|d| d.year()).unwrap_or(self.today.year()),
             None => {
                 self.year_stats = None;
                 return;
             }
         };
 
-        // Find the earliest start and latest end among all quarters in this year.
-        let year_start: Option<NaiveDate> = self
-            .quarter_data
-            .quarters
+        let all = self.time_period_data.all();
+        let year_periods: Vec<&TimePeriod> = all
             .iter()
-            .filter(|q| q.year == year_str)
-            .filter_map(|q| q.start_date)
-            .min();
-        let year_end: Option<NaiveDate> = self
-            .quarter_data
-            .quarters
-            .iter()
-            .filter(|q| q.year == year_str)
-            .filter_map(|q| q.end_date)
-            .max();
+            .filter(|tp| tp.start_date.map(|d| d.year()) == Some(year))
+            .collect();
 
-        let (start, end) = match (year_start, year_end) {
-            (Some(s), Some(e)) => (s, e),
-            _ => {
-                self.year_stats = None;
-                return;
-            }
-        };
+        if year_periods.is_empty() {
+            self.year_stats = None;
+            return;
+        }
 
-        // Build a synthetic QuarterConfig spanning the full year range.
-        let year_q = QuarterConfig {
-            key: format!("YEAR_{}", year_str),
-            quarter: "YEAR".to_string(),
-            year: year_str,
-            start_date_raw: start.format("%Y-%m-%d").to_string(),
-            end_date_raw: end.format("%Y-%m-%d").to_string(),
-            start_date: Some(start),
-            end_date: Some(end),
-        };
-
-        match calculate_quarter_stats(
-            &year_q,
+        match calculate_year_stats(
+            &year_periods,
             self.badge_data,
             self.holiday_data,
             self.vacation_data,
+            self.settings.goal,
             None,
         ) {
-            Ok(stats) => self.year_stats = Some(stats),
-            Err(_) => self.year_stats = None,
+            Ok(Some(stats)) => self.year_stats = Some(stats),
+            _ => self.year_stats = None,
+        }
+    }
+
+    fn switch_time_period_view(&mut self, dir: i32) {
+        let n = self.settings.time_periods.len();
+        if n <= 1 {
+            return;
+        }
+        let new_idx = ((self.active_time_period_idx as i32 + dir).rem_euclid(n as i32)) as usize;
+        self.active_time_period_idx = new_idx;
+        let tp_file = self.settings.active_time_period_file(new_idx);
+        match TimePeriodData::load_from(&self.data_dir, tp_file) {
+            Ok(td) => {
+                self.time_period_data = td;
+                self.nav_date = self.today;
+                self.selected_date = self.today;
+                if let Some(p) = self.time_period_data.get_period_by_date(self.selected_date) {
+                    if let Some(start) = p.start_date {
+                        self.nav_date = start;
+                    }
+                } else if let Ok(p) = self.time_period_data.nearest_period(self.selected_date)
+                    && let Some(start) = p.start_date
+                {
+                    self.nav_date = start;
+                    self.selected_date = start;
+                }
+                self.update_stats();
+            }
+            Err(_e) => {
+                self.git_status = Some(("Error loading time period file".to_string(), Color::Red));
+            }
+        }
+    }
+
+    fn navigate_to_adjacent_period(&mut self, dir: i32) {
+        let current = match self.current_period() {
+            Some(p) => p.key.clone(),
+            None => return,
+        };
+        let all = self.time_period_data.all();
+        for (i, tp) in all.iter().enumerate() {
+            if tp.key == current {
+                let next = i as i32 + dir;
+                if next >= 0 && (next as usize) < all.len() {
+                    let np = &all[next as usize];
+                    if let Some(start) = np.start_date {
+                        self.selected_date = start;
+                        self.nav_date = start;
+                        self.update_stats();
+                    }
+                }
+                return;
+            }
         }
     }
 
@@ -268,8 +288,7 @@ impl<'a> App<'a> {
 
         match &commit_out {
             Err(e) => {
-                self.git_status =
-                    Some((format!("git commit error: {}", e), Color::Red));
+                self.git_status = Some((format!("git commit error: {}", e), Color::Red));
                 return;
             }
             Ok(out) => {
@@ -279,14 +298,15 @@ impl<'a> App<'a> {
                     || stderr.contains("nothing to commit")
                     || stdout.contains("nothing added")
                 {
-                    self.git_status =
-                        Some(("Nothing to commit — already up to date".to_string(), Color::Yellow));
+                    self.git_status = Some((
+                        "Nothing to commit — already up to date".to_string(),
+                        Color::Yellow,
+                    ));
                     return;
                 }
                 if !out.status.success() {
                     let detail = stdout.trim().to_string();
-                    self.git_status =
-                        Some((format!("git commit failed: {}", detail), Color::Red));
+                    self.git_status = Some((format!("git commit failed: {}", detail), Color::Red));
                     return;
                 }
             }
@@ -312,10 +332,8 @@ impl<'a> App<'a> {
                 .unwrap_or(false);
 
             if push_ok {
-                self.git_status = Some((
-                    format!("Backed up & pushed — {}", timestamp),
-                    Color::Green,
-                ));
+                self.git_status =
+                    Some((format!("Backed up & pushed — {}", timestamp), Color::Green));
             } else {
                 self.git_status = Some((
                     format!("Committed locally (push failed) — {}", timestamp),
@@ -323,10 +341,7 @@ impl<'a> App<'a> {
                 ));
             }
         } else {
-            self.git_status = Some((
-                format!("Backed up locally — {}", timestamp),
-                Color::Cyan,
-            ));
+            self.git_status = Some((format!("Backed up locally — {}", timestamp), Color::Cyan));
         }
     }
 
@@ -440,6 +455,12 @@ impl<'a> App<'a> {
 
             Mode::Normal => {
                 match code {
+                    KeyCode::Right if modifiers.contains(KeyModifiers::SHIFT) => {
+                        self.switch_time_period_view(1);
+                    }
+                    KeyCode::Left if modifiers.contains(KeyModifiers::SHIFT) => {
+                        self.switch_time_period_view(-1);
+                    }
                     KeyCode::Left => {
                         if let Some(d) = self.selected_date.checked_sub_signed(Duration::days(1)) {
                             self.selected_date = d;
@@ -461,7 +482,10 @@ impl<'a> App<'a> {
                         }
                     }
                     KeyCode::Char(' ') => {
-                        if self.current_quarter.is_some() {
+                        self.switch_time_period_view(1);
+                    }
+                    KeyCode::Char('b') => {
+                        if self.current_period().is_some() {
                             let date_key = self.selected_date.format("%Y-%m-%d").to_string();
                             if self.badge_data.has(&date_key) {
                                 self.badge_data.remove(&date_key);
@@ -474,7 +498,7 @@ impl<'a> App<'a> {
                         }
                     }
                     KeyCode::Char('f') => {
-                        if self.current_quarter.is_some() {
+                        if self.current_period().is_some() {
                             let date_key = self.selected_date.format("%Y-%m-%d").to_string();
                             if self.badge_data.has(&date_key) {
                                 self.badge_data.remove(&date_key);
@@ -498,18 +522,10 @@ impl<'a> App<'a> {
                         }
                     }
                     KeyCode::Char('n') => {
-                        let target = add_months(self.nav_date, 3);
-                        self.nav_date = target;
-                        self.current_quarter =
-                            self.quarter_data.get_quarter_by_date(target);
-                        self.update_stats();
+                        self.navigate_to_adjacent_period(1);
                     }
                     KeyCode::Char('p') => {
-                        let target = add_months(self.nav_date, -3);
-                        self.nav_date = target;
-                        self.current_quarter =
-                            self.quarter_data.get_quarter_by_date(target);
-                        self.update_stats();
+                        self.navigate_to_adjacent_period(-1);
                     }
                     KeyCode::Char('a') => {
                         self.mode = Mode::Add;
@@ -582,246 +598,341 @@ impl<'a> App<'a> {
             ViewState::Calendar => {
                 let size = f.area();
 
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
+                // Horizontal split: left (calendar + events/help), right (stats panels)
+                let h_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
                     .constraints([
-                        Constraint::Length(9),  // calendar (3 months, max 8 rows + 1 padding)
-                        Constraint::Length(30), // quarter stats table (5 sections with spacers + working/available days)
-                        Constraint::Length(11), // year stats table (8 data rows + header + borders)
-                        Constraint::Min(12),    // events + help table
+                        Constraint::Min(30),    // left: calendar + events
+                        Constraint::Length(68), // right: stats panels (40+14+8 cols + borders)
                     ])
                     .split(size);
 
-                self.render_calendar(f, chunks[0]);
-                self.render_stats(f, chunks[1]);
-                self.render_year_stats(f, chunks[2]);
-                self.render_events_and_help(f, chunks[3]);
+                // Left panel: calendar on top, events+help below
+                let months = self.period_months();
+                let cols = self.time_period_data.calendar_display_columns() as usize;
+                let month_rows = if cols > 0 {
+                    months.len().div_ceil(cols)
+                } else {
+                    1
+                };
+                let cal_height = (month_rows as u16 * 10) + 1;
+
+                let left_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(cal_height), Constraint::Min(10)])
+                    .split(h_chunks[0]);
+
+                self.render_calendar(f, left_chunks[0]);
+                self.render_events_and_help(f, left_chunks[1]);
+
+                // Right panel: period stats on top, year stats below
+                let right_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(18), Constraint::Min(12)])
+                    .split(h_chunks[1]);
+
+                self.render_stats(f, right_chunks[0]);
+                self.render_year_stats(f, right_chunks[1]);
             }
         }
+    }
+
+    fn period_months(&self) -> Vec<NaiveDate> {
+        if let Some(period) = self.current_period()
+            && let (Some(start), Some(end)) = (period.start_date, period.end_date)
+        {
+            let start_month = NaiveDate::from_ymd_opt(start.year(), start.month(), 1).unwrap();
+            let end_month = NaiveDate::from_ymd_opt(end.year(), end.month(), 1).unwrap();
+            let mut months = Vec::new();
+            let mut mo = start_month;
+            while mo <= end_month {
+                months.push(mo);
+                mo = add_months(mo, 1);
+            }
+            return months;
+        }
+        vec![
+            self.nav_date,
+            add_months(self.nav_date, 1),
+            add_months(self.nav_date, 2),
+        ]
+    }
+
+    fn render_single_month(
+        &self,
+        month_date: NaiveDate,
+        stats: &Option<QuarterStats>,
+        event_map: &std::collections::HashMap<String, Vec<&Event>>,
+        holiday_map: &std::collections::HashMap<String, &Holiday>,
+        vacation_map: &std::collections::HashMap<String, Vacation>,
+        today: NaiveDate,
+    ) -> Vec<Line<'static>> {
+        let year = month_date.year();
+        let month = month_date.month();
+        let title = format!("{} {}", month_name(month), year);
+        let header_str = " Su Mo Tu We Th Fr Sa   ";
+
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::from(Span::styled(
+                format!("{:^24}", title),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                header_str.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+
+        let first_of_month = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+        let dim = days_in_month(year, month);
+        let start_dow = first_of_month.weekday().num_days_from_sunday() as usize;
+
+        let mut day_cells: Vec<Span<'static>> = Vec::new();
+        for _ in 0..start_dow {
+            day_cells.push(Span::raw("  ".to_string()));
+        }
+
+        for d in 1..=dim {
+            let date = NaiveDate::from_ymd_opt(year, month, d).unwrap();
+            let date_key = date.format("%Y-%m-%d").to_string();
+
+            let is_selected = date == self.selected_date;
+            let is_today = date == today;
+            let is_weekend =
+                date.weekday() == chrono::Weekday::Sat || date.weekday() == chrono::Weekday::Sun;
+
+            let (is_badged, is_flex) = if let Some(s) = stats {
+                let w = s.workday_stats.get(&date_key);
+                (
+                    w.map(|wd| wd.is_badged_in).unwrap_or(false),
+                    w.map(|wd| wd.is_flex_credit).unwrap_or(false),
+                )
+            } else {
+                (false, false)
+            };
+
+            let is_holiday_or_vacation = if let Some(s) = stats {
+                s.workday_stats
+                    .get(&date_key)
+                    .map(|w| w.is_holiday || w.is_vacation)
+                    .unwrap_or(false)
+            } else {
+                holiday_map.contains_key(&date_key) || vacation_map.contains_key(&date_key)
+            };
+
+            let has_event = event_map.contains_key(&date_key);
+
+            let style = calendar_day_style(
+                is_selected,
+                is_badged,
+                is_flex,
+                is_holiday_or_vacation,
+                is_today,
+                is_weekend,
+                has_event,
+            );
+            day_cells.push(Span::styled(format!("{:2}", d), style));
+        }
+
+        let mut idx = 0;
+        while idx < day_cells.len() {
+            let end = (idx + 7).min(day_cells.len());
+            let mut row_spans: Vec<Span<'static>> = Vec::new();
+            row_spans.push(Span::raw(" ".to_string()));
+            for (i, cell) in day_cells[idx..end].iter().enumerate() {
+                row_spans.push(cell.clone());
+                if i < end - idx - 1 {
+                    row_spans.push(Span::raw(" ".to_string()));
+                }
+            }
+            let cells_in_row = end - idx;
+            for _ in cells_in_row..7 {
+                row_spans.push(Span::raw("   ".to_string()));
+            }
+            row_spans.push(Span::raw("   ".to_string()));
+            lines.push(Line::from(row_spans));
+            idx += 7;
+        }
+
+        lines
     }
 
     fn render_calendar(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let q = match self.current_quarter {
-            Some(q) => q,
-            None => {
-                let p = Paragraph::new("Configuration Error: Current quarter not set.");
-                f.render_widget(p, area);
-                return;
-            }
-        };
-        let stats = match &self.quarter_stats {
-            Some(s) => s,
-            None => {
-                let p = Paragraph::new("Loading stats...");
-                f.render_widget(p, area);
-                return;
-            }
-        };
-
-        let start = match q.start_date {
-            Some(s) => s,
-            None => return,
-        };
-
+        let stats = &self.active_stats;
         let today = self.today;
         let event_map = self.event_data.get_event_map();
+        let holiday_map = self.holiday_data.get_holiday_map();
+        let vacation_map = self.vacation_data.get_vacation_map();
 
-        // Fixed-width columns: 21-char months, 11-char gaps, Min(0) absorbs leftover
-        const MONTH_WIDTH: u16 = 21;
-        const GAP_WIDTH: u16 = 11;
-        let month_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(MONTH_WIDTH),
-                Constraint::Length(GAP_WIDTH),
-                Constraint::Length(MONTH_WIDTH),
-                Constraint::Length(GAP_WIDTH),
-                Constraint::Length(MONTH_WIDTH),
-                Constraint::Min(0),
-            ])
-            .split(area);
-        let month_rects = [month_chunks[0], month_chunks[2], month_chunks[4]];
+        let months = self.period_months();
+        let cols = self.time_period_data.calendar_display_columns() as usize;
 
-        for i in 0..3 {
-            let month_date = add_months(start, i as i32);
-            let year = month_date.year();
-            let month = month_date.month();
+        let mut all_lines: Vec<Line> = Vec::new();
 
-            let title = format!("{} {}", month_name(month), year);
-            let header = "Su Mo Tu We Th Fr Sa";
-
-            let first_of_month = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
-            let days_in_month = days_in_month(year, month);
-            let start_dow = first_of_month.weekday().num_days_from_sunday() as usize;
-
-            let mut lines: Vec<Line> = vec![
-                Line::from(Span::styled(
-                    format!("{:^21}", title),
-                    Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                )),
-                Line::from(header),
-            ];
-
-            let mut day = 1usize;
-            for _row in 0..6 {
-                if day > days_in_month as usize {
-                    break;
-                }
-                let mut spans = Vec::new();
-                for col in 0..7usize {
-                    if (_row == 0 && col < start_dow) || day > days_in_month as usize {
-                        spans.push(Span::raw("   "));
-                        continue;
-                    }
-                    let date = NaiveDate::from_ymd_opt(year, month, day as u32).unwrap();
-                    let date_key = date.format("%Y-%m-%d").to_string();
-                    let day_str = format!("{:2}", day);
-
-                    let workday_entry = stats.workday_stats.get(&date_key);
-                    let is_today = date == today;
-                    let is_selected = date == self.selected_date;
-                    let is_badged = workday_entry.map(|w| w.is_badged_in).unwrap_or(false);
-                    let is_flex = workday_entry.map(|w| w.is_flex_credit).unwrap_or(false);
-                    let is_holiday_or_vacation = workday_entry
-                        .map(|w| w.is_holiday || w.is_vacation)
-                        .unwrap_or(false);
-                    let is_weekend = workday_entry.is_none();
-                    let has_event = event_map.contains_key(&date_key);
-
-                    let style = calendar_day_style(
-                        is_selected,
-                        is_badged,
-                        is_flex,
-                        is_holiday_or_vacation,
-                        is_today,
-                        is_weekend,
-                        has_event,
-                    );
-
-                    spans.push(Span::styled(day_str, style));
-                    spans.push(Span::raw(" "));
-                    day += 1;
-                }
-                lines.push(Line::from(spans));
-            }
-
-            let calendar_widget =
-                Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
-            f.render_widget(calendar_widget, month_rects[i]);
+        if self.is_what_if() {
+            all_lines.push(Line::from(Span::styled(
+                " ⚠ WHAT-IF MODE  (press w to exit, q to discard & quit) ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .bg(Color::Indexed(52))
+                    .add_modifier(Modifier::BOLD),
+            )));
         }
+
+        if let Some(period) = self.current_period()
+            && let (Some(start), Some(end)) = (period.start_date, period.end_date)
+        {
+            all_lines.push(Line::from(Span::styled(
+                format!(
+                    " {}  [{} – {}]",
+                    period.key,
+                    start.format("%b %-d, %Y"),
+                    end.format("%b %-d, %Y"),
+                ),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            all_lines.push(Line::from(""));
+        }
+
+        let cols = if cols == 0 { 3 } else { cols };
+        for chunk_start in (0..months.len()).step_by(cols) {
+            let chunk_end = (chunk_start + cols).min(months.len());
+            let row_months = &months[chunk_start..chunk_end];
+
+            let month_renders: Vec<Vec<Line>> = row_months
+                .iter()
+                .map(|&month_date| {
+                    self.render_single_month(
+                        month_date,
+                        stats,
+                        &event_map,
+                        &holiday_map,
+                        &vacation_map,
+                        today,
+                    )
+                })
+                .collect();
+
+            let max_lines = month_renders.iter().map(|r| r.len()).max().unwrap_or(0);
+
+            for line_idx in 0..max_lines {
+                let mut spans: Vec<Span> = Vec::new();
+                for (m_idx, month_lines) in month_renders.iter().enumerate() {
+                    if m_idx > 0 {
+                        spans.push(Span::raw("  "));
+                    }
+                    if line_idx < month_lines.len() {
+                        spans.extend(month_lines[line_idx].spans.clone());
+                    } else {
+                        spans.push(Span::raw("                        "));
+                    }
+                }
+                all_lines.push(Line::from(spans));
+            }
+            all_lines.push(Line::from(""));
+        }
+
+        let widget = Paragraph::new(all_lines).block(Block::default().borders(Borders::NONE));
+        f.render_widget(widget, area);
     }
 
     fn render_stats(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let stats = match &self.quarter_stats {
+        let stats = match &self.active_stats {
             Some(s) => s.clone(),
             None => return,
         };
 
-        // ── Computed display values ───────────────────────────────────────────────
-
-        let status_color = match stats.compliance_status.as_str() {
-            "Achieved" => Color::Green,
-            "On Track" => Color::Cyan,
-            "At Risk" => Color::Yellow,
-            "Impossible" | _ => Color::Red,
+        let status_style = match stats.compliance_status.as_str() {
+            "Achieved" => Style::default()
+                .fg(Color::Indexed(46))
+                .add_modifier(Modifier::BOLD),
+            "On Track" => Style::default().fg(Color::Indexed(40)),
+            "At Risk" => Style::default().fg(Color::Indexed(208)),
+            "Impossible" => Style::default()
+                .fg(Color::Indexed(196))
+                .add_modifier(Modifier::BOLD),
+            _ => Style::default(),
         };
 
+        let pace_str = format!("{:+} days", stats.days_ahead_of_pace);
         let pace_str = if stats.days_ahead_of_pace > 0 {
-            format!("+{} days ahead", stats.days_ahead_of_pace)
-        } else if stats.days_ahead_of_pace < 0 {
-            format!("{} days behind", stats.days_ahead_of_pace)
+            format!("{} ahead", pace_str)
         } else {
-            "On pace".to_string()
-        };
-        let pace_color = if stats.days_ahead_of_pace >= 0 {
-            Color::Green
-        } else {
-            Color::Red
-        };
-
-        let skip_color = if stats.remaining_missable_days > 5 {
-            Color::Green
-        } else if stats.remaining_missable_days > 0 {
-            Color::Yellow
-        } else {
-            Color::Red
-        };
-
-        let required_pct = if stats.total_days > 0 {
-            100.0 * stats.days_required as f64 / stats.total_days as f64
-        } else {
-            0.0
-        };
-
-        let still_needed_color = if stats.days_still_needed == 0 {
-            Color::Green
-        } else if stats.days_still_needed <= 5 {
-            Color::Yellow
-        } else {
-            Color::White
-        };
-
-        let rate_so_far_color = if stats.current_average >= 50.0 {
-            Color::Green
-        } else if stats.current_average >= 45.0 {
-            Color::Yellow
-        } else {
-            Color::Red
-        };
-
-        let rate_needed_color = if stats.required_future_average <= 50.0 {
-            Color::Green
-        } else if stats.required_future_average <= 70.0 {
-            Color::Yellow
-        } else {
-            Color::Red
-        };
-        let rate_needed_val = format!("{} / {}", stats.days_still_needed, stats.days_left);
-        let rate_needed_pct = if stats.days_left > 0 {
-            format!("{:.1}%", stats.required_future_average)
-        } else if stats.days_still_needed > 0 {
-            "Infinite".to_string()
-        } else {
-            "N/A".to_string()
+            pace_str
         };
 
         let office_days = stats.days_badged_in - stats.flex_days;
+        let goal_pct = if stats.total_days > 0 {
+            format!(
+                "{:.1}%",
+                stats.days_required as f64 / stats.total_days as f64 * 100.0
+            )
+        } else {
+            String::new()
+        };
+        let office_pct = if stats.days_required > 0 {
+            format!(
+                "{:.1}%",
+                stats.days_badged_in as f64 / stats.days_required as f64 * 100.0
+            )
+        } else {
+            String::new()
+        };
+        let (badge_pct, flex_pct) = if stats.days_badged_in > 0 {
+            (
+                format!(
+                    "{:.1}%",
+                    office_days as f64 / stats.days_badged_in as f64 * 100.0
+                ),
+                format!(
+                    "{:.1}%",
+                    stats.flex_days as f64 / stats.days_badged_in as f64 * 100.0
+                ),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        let needed_pct = if stats.days_required > 0 {
+            format!(
+                "{:.1}%",
+                stats.days_still_needed as f64 / stats.days_required as f64 * 100.0
+            )
+        } else {
+            String::new()
+        };
 
-        // ── Build rows ────────────────────────────────────────────────────────────
-        let header_style = Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
-        let header = Row::new(vec![
-            Cell::from("Metric").style(header_style),
-            Cell::from("Value").style(header_style),
-            Cell::from("%").style(header_style),
-        ]);
+        let skippable_label = format!(
+            "Skippable Days ({} left - {} needed)",
+            stats.days_left, stats.days_still_needed
+        );
 
-        let mut rows: Vec<Row> = vec![
-            // ── STATUS ────────────────────────────────────────────────────────────
+        let rows: Vec<Row> = vec![
             section_header("STATUS"),
             data_row(
                 "Status",
-                colored(stats.compliance_status.clone(), status_color),
+                Cell::from(stats.compliance_status.clone()).style(status_style),
                 plain(""),
             ),
-            data_row("Days Ahead of Pace", colored(pace_str, pace_color), plain("")),
+            data_row("Days Ahead of Pace", plain(pace_str), plain("")),
             data_row(
-                "Skippable Days Left",
-                colored(format!("{}", stats.remaining_missable_days), skip_color),
+                &skippable_label,
+                plain(format!("{}", stats.remaining_missable_days)),
                 plain(""),
             ),
             spacer(),
-            // ── PROGRESS ─────────────────────────────────────────────────────────
             section_header("PROGRESS"),
             data_row(
-                "Total Days in Qtr",
+                "Total Days",
                 plain(format!("{}", stats.total_calendar_days)),
                 plain(""),
             ),
             data_row(
                 "Total Working Days",
-                plain(format!("{}", stats.available_workdays)),
+                plain(format!("{}", stats.available_workdays - stats.holidays)),
                 plain(""),
             ),
             data_row(
@@ -830,112 +941,68 @@ impl<'a> App<'a> {
                 plain(""),
             ),
             data_row(
-                "Goal (50% Required)",
+                format!("Goal ({}% Required)", self.settings.goal),
                 plain(format!("{} / {}", stats.days_required, stats.total_days)),
-                plain(format!("{:.1}%", required_pct)),
+                plain(goal_pct),
             ),
             data_row(
-                "Badged In Days",
-                plain(format!("{}", stats.days_badged_in)),
-                plain(""),
+                "Office Days",
+                plain(format!(
+                    "{} / {}",
+                    stats.days_badged_in, stats.days_required
+                )),
+                plain(office_pct),
+            ),
+            data_row(
+                " Badge-In Days",
+                plain(format!("{}", office_days)),
+                plain(badge_pct),
+            ),
+            data_row(
+                " Flex Credits",
+                plain(format!("{}", stats.flex_days)),
+                plain(flex_pct),
             ),
             data_row(
                 "Still Needed",
-                colored(format!("{}", stats.days_still_needed), still_needed_color),
-                plain(""),
-            ),
-            data_row(
-                "Rate So Far",
-                plain(format!("{} / {}", stats.days_badged_in, stats.days_thus_far)),
-                colored(format!("{:.1}%", stats.current_average), rate_so_far_color),
-            ),
-            spacer(),
-            // ── BADGE BREAKDOWN ───────────────────────────────────────────────────
-            section_header("BADGE BREAKDOWN"),
-            data_row("Office Days", plain(format!("{}", office_days)), plain("")),
-            data_row(
-                "Flex Credits",
-                colored(format!("{}", stats.flex_days), FLEX_COLOR),
-                plain(""),
-            ),
-            data_row(
-                "Total Badged In",
-                plain(format!("{}", stats.days_badged_in)),
-                plain(""),
-            ),
-            spacer(),
-            // ── LOOKING AHEAD ─────────────────────────────────────────────────────
-            section_header("LOOKING AHEAD"),
-            data_row(
-                "Rate Needed (Remaining)",
-                plain(rate_needed_val),
-                colored(rate_needed_pct, rate_needed_color),
+                plain(format!(
+                    "{} / {}",
+                    stats.days_still_needed, stats.days_required
+                )),
+                plain(needed_pct),
             ),
         ];
 
-        if let Some(proj) = stats.projected_completion_date {
-            rows.push(data_row(
-                "Projected Completion",
-                plain(proj.format("%Y-%m-%d").to_string()),
-                plain(""),
-            ));
-        }
-
-        rows.extend_from_slice(&[
-            spacer(),
-            // ── DAYS OFF ──────────────────────────────────────────────────────────
-            section_header("DAYS OFF"),
-            data_row("Holidays", plain(format!("{}", stats.holidays)), plain("")),
-            data_row(
-                "Vacation Days",
-                plain(format!("{}", stats.vacation_days)),
-                plain(""),
-            ),
-            data_row(
-                "Total Days Off",
-                plain(format!("{}", stats.days_off)),
-                plain(""),
-            ),
-        ]);
-
         let quarter_key = self
-            .current_quarter
+            .current_period()
             .map(|q| q.key.as_str())
             .unwrap_or("N/A");
+        let bold_white = Style::default()
+            .fg(Color::Indexed(231))
+            .add_modifier(Modifier::BOLD);
         let (title_text, title_style) = if self.is_what_if() {
             (
-                format!(" Quarter Stats: {} [What-If Mode] ", quarter_key),
-                Style::default()
-                    .fg(FLEX_COLOR)
-                    .add_modifier(Modifier::BOLD),
+                format!(" Period Stats: {} [What-If Mode] ", quarter_key),
+                Style::default().fg(FLEX_COLOR).add_modifier(Modifier::BOLD),
             )
         } else {
-            (
-                format!(" Quarter Stats: {} ", quarter_key),
-                Style::default(),
-            )
+            (format!(" Period Stats: {} ", quarter_key), bold_white)
         };
 
         let table = Table::new(
             rows,
             [
-                Constraint::Length(26),
-                Constraint::Length(16),
+                Constraint::Length(40),
+                Constraint::Length(14),
                 Constraint::Length(8),
             ],
         )
-        .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(bold_white)
                 .title(title_text)
                 .title_style(title_style),
-        )
-        .row_highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
         );
 
         f.render_stateful_widget(table, area, &mut self.table_state);
@@ -946,21 +1013,29 @@ impl<'a> App<'a> {
             Some(s) => s.clone(),
             None => return,
         };
-        let year = match self.current_quarter {
-            Some(q) => q.year.as_str().to_string(),
+        let year = match self.current_period() {
+            Some(q) => q
+                .start_date
+                .map(|d| d.year().to_string())
+                .unwrap_or_default(),
             None => return,
         };
 
         let office_days = stats.days_badged_in - stats.flex_days;
-
-        let header_style = Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
-        let header = Row::new(vec![
-            Cell::from("Metric").style(header_style),
-            Cell::from("Value").style(header_style),
-            Cell::from("").style(header_style),
-        ]);
+        let (badge_pct, flex_pct) = if stats.days_badged_in > 0 {
+            (
+                format!(
+                    "{:.1}%",
+                    office_days as f64 / stats.days_badged_in as f64 * 100.0
+                ),
+                format!(
+                    "{:.1}%",
+                    stats.flex_days as f64 / stats.days_badged_in as f64 * 100.0
+                ),
+            )
+        } else {
+            (String::new(), String::new())
+        };
 
         let rows = vec![
             data_row(
@@ -970,7 +1045,7 @@ impl<'a> App<'a> {
             ),
             data_row(
                 "Total Working Days",
-                plain(format!("{}", stats.available_workdays)),
+                plain(format!("{}", stats.available_workdays - stats.holidays)),
                 plain(""),
             ),
             data_row(
@@ -984,32 +1059,40 @@ impl<'a> App<'a> {
                 plain(format!("{}", stats.vacation_days)),
                 plain(""),
             ),
-            data_row("Office Days", plain(format!("{}", office_days)), plain("")),
             data_row(
-                "Flex Credits",
-                colored(format!("{}", stats.flex_days), FLEX_COLOR),
-                plain(""),
-            ),
-            data_row(
-                "Total Badged In",
+                "Office Days",
                 plain(format!("{}", stats.days_badged_in)),
                 plain(""),
             ),
+            data_row(
+                " Badge-In Days",
+                plain(format!("{}", office_days)),
+                plain(badge_pct),
+            ),
+            data_row(
+                " Flex Credits",
+                plain(format!("{}", stats.flex_days)),
+                plain(flex_pct),
+            ),
         ];
 
+        let bold_white = Style::default()
+            .fg(Color::Indexed(231))
+            .add_modifier(Modifier::BOLD);
         let table = Table::new(
             rows,
             [
-                Constraint::Length(26),
-                Constraint::Length(16),
+                Constraint::Length(40),
+                Constraint::Length(14),
                 Constraint::Length(8),
             ],
         )
-        .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Year Stats: {} ", year)),
+                .border_style(bold_white)
+                .title(format!(" Year Stats: {} ", year))
+                .title_style(bold_white),
         );
 
         f.render_widget(table, area);
@@ -1026,7 +1109,6 @@ impl<'a> App<'a> {
 
         let mut lines: Vec<Line> = Vec::new();
 
-        // ── Git backup status (shown until next keypress) ─────────────────────
         if let Some((msg, color)) = &self.git_status {
             lines.push(Line::from(vec![
                 Span::styled(
@@ -1043,14 +1125,20 @@ impl<'a> App<'a> {
             lines.push(Line::from(""));
         }
 
-        // ── Events for selected date ──────────────────────────────────────────
-        lines.push(Line::from(format!("Events for {}:", date_key)));
+        let event_style = Style::default().fg(Color::Yellow);
+        lines.push(Line::from(Span::styled(
+            format!(
+                " Events for {}:",
+                self.selected_date.format("%a %b %-d, %Y")
+            ),
+            event_style.add_modifier(Modifier::BOLD),
+        )));
 
         match self.mode {
             Mode::Add => {
-                lines.push(Line::from(format!(
-                    "  Adding: {}_",
-                    self.input_buffer
+                lines.push(Line::from(Span::styled(
+                    format!(" Add event: {}_", self.input_buffer),
+                    event_style,
                 )));
             }
             Mode::Delete => {
@@ -1059,14 +1147,21 @@ impl<'a> App<'a> {
                     lines.push(Line::from("  (no events)"));
                 } else {
                     for (i, e) in events.iter().enumerate() {
-                        let prefix = if i == self.cursor_index { "  > " } else { "    " };
+                        let prefix = if i == self.cursor_index {
+                            "  > "
+                        } else {
+                            "    "
+                        };
                         lines.push(Line::from(format!("{}{}", prefix, e.description)));
                     }
                     lines.push(Line::from("  Enter=delete  Esc=cancel  ↑↓=move"));
                 }
             }
             Mode::Search => {
-                lines.push(Line::from(format!("  Search: {}_", self.input_buffer)));
+                lines.push(Line::from(Span::styled(
+                    format!(" Search: {}_", self.input_buffer),
+                    event_style,
+                )));
                 for event in search_events(&self.event_data.events, &self.input_buffer) {
                     lines.push(Line::from(format!(
                         "  {} — {}",
@@ -1076,7 +1171,10 @@ impl<'a> App<'a> {
             }
             _ => {
                 if events.is_empty() {
-                    lines.push(Line::from("  (no events)"));
+                    lines.push(Line::from(Span::styled(
+                        "  (none)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
                 } else {
                     for e in &events {
                         lines.push(Line::from(format!("  • {}", e.description)));
@@ -1085,66 +1183,109 @@ impl<'a> App<'a> {
             }
         }
 
-        // ── Key bindings as a Table ───────────────────────────────────────────
-        let what_if_action = if self.is_what_if() {
-            "Exit What-If Mode"
-        } else {
-            "Enter What-If Mode"
-        };
+        lines.push(Line::from(""));
 
-        let key_rows: Vec<Row> = vec![
-            Row::new(vec!["← → ↑ ↓", "Move date", "n / p", "Next/prev quarter"]),
-            Row::new(vec!["Space", "Badge (office)", "f", "Flex credit"]),
-            Row::new(vec!["a", "Add event", "d", "Delete event"]),
-            Row::new(vec!["s", "Search", "w", what_if_action]),
-            Row::new(vec!["g", "Git backup", "v", "Vacations"]),
-            Row::new(vec!["h", "Holidays", "o", "Settings"]),
-            Row::new(vec!["q/Ctrl+C", "Quit", "", ""]),
+        let key_style = Style::default().fg(Color::Indexed(51));
+        let help_style = Style::default().fg(Color::DarkGray);
+
+        let mut view_label = self
+            .settings
+            .active_time_period_file(self.active_time_period_idx)
+            .to_string();
+        if self.settings.time_periods.len() > 1 {
+            view_label += &format!(
+                "  ({} of {})",
+                self.active_time_period_idx + 1,
+                self.settings.time_periods.len()
+            );
+        }
+        lines.push(Line::from(vec![
+            Span::styled("[space/shift+←→]", key_style),
+            Span::raw(" "),
+            Span::styled(view_label, help_style),
+        ]));
+
+        let bindings: Vec<(&str, String)> = vec![
+            ("←→↑↓", "Navigate".to_string()),
+            ("b", self.settings.default_office.clone()),
+            ("f", self.settings.flex_credit.clone()),
+            ("n/p", "Next/Prev period".to_string()),
+            ("a", "Add event".to_string()),
+            ("d", "Delete event".to_string()),
+            ("s", "Search".to_string()),
+            ("w", "What-if".to_string()),
+            ("g", "Git backup".to_string()),
+            ("v", "Vacations".to_string()),
+            ("h", "Holidays".to_string()),
+            ("o", "Settings".to_string()),
+            ("q", "Quit".to_string()),
         ];
 
-        let help_table = Table::new(
-            key_rows,
-            [
-                Constraint::Length(12),
-                Constraint::Length(24),
-                Constraint::Length(12),
-                Constraint::Length(24),
-            ],
-        )
-        .block(Block::default().borders(Borders::NONE))
-        .column_spacing(1);
+        const KEY_COL_WIDTH: usize = 24;
+        for chunk in bindings.chunks(3) {
+            let mut spans: Vec<Span> = Vec::new();
+            for (key, desc) in chunk.iter() {
+                let bracket_key = format!("[{}]", key);
+                let cell_text = format!("{} {}", bracket_key, desc);
+                let visible_len = cell_text.chars().count();
+                let pad = if KEY_COL_WIDTH > visible_len {
+                    KEY_COL_WIDTH - visible_len
+                } else {
+                    1
+                };
+                spans.push(Span::styled(bracket_key, key_style));
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(desc.clone(), help_style));
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            lines.push(Line::from(spans));
+        }
 
-        // Split the area: events content on top, help table + footer on bottom
-        let bottom_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(2),     // events content
-                Constraint::Length(8),  // help table (6 rows + 1 blank + footer)
-            ])
-            .split(area);
+        lines.push(Line::from(Span::styled(
+            format!("Data: {}", self.data_dir.to_string_lossy()),
+            help_style,
+        )));
+
+        let git_info = crate::cmd::backup::status(&self.data_dir);
+        if git_info.is_repo {
+            let mut parts: Vec<Span> = vec![Span::styled("  Git: ", help_style)];
+            let mut status_parts: Vec<String> = Vec::new();
+            if git_info.modified > 0 {
+                status_parts.push(format!("{} modified", git_info.modified));
+            }
+            if git_info.untracked > 0 {
+                status_parts.push(format!("{} untracked", git_info.untracked));
+            }
+            if status_parts.is_empty() {
+                parts.push(Span::styled(
+                    "clean",
+                    Style::default().fg(Color::Indexed(34)),
+                ));
+            } else {
+                let status_str = status_parts.join(", ");
+                parts.push(Span::styled(
+                    status_str,
+                    Style::default().fg(Color::Indexed(196)),
+                ));
+            }
+            if git_info.has_remote {
+                parts.push(Span::styled("  (remote: origin)", help_style));
+            }
+            if git_info.modified > 0 || git_info.untracked > 0 {
+                parts.push(Span::styled("  [press g to backup]", help_style));
+            }
+            lines.push(Line::from(parts));
+
+            if !git_info.last_commit.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  Last: {}", git_info.last_commit),
+                    help_style,
+                )));
+            }
+        }
 
         let p = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
-        f.render_widget(p, bottom_chunks[0]);
-
-        // Render help table + footer in the bottom chunk
-        let help_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(6),    // help table
-                Constraint::Length(1), // data dir footer
-            ])
-            .split(bottom_chunks[1]);
-
-        f.render_widget(help_table, help_chunks[0]);
-
-        let footer = Paragraph::new(Line::from(vec![
-            Span::styled("Data  ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(
-                self.data_dir.to_string_lossy().to_string(),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-        f.render_widget(footer, help_chunks[1]);
+        f.render_widget(p, area);
     }
 
     // ── Vacation View ─────────────────────────────────────────────────────────
@@ -1216,18 +1357,21 @@ impl<'a> App<'a> {
         // Bottom panel: add/edit form or key hints
         let bottom = chunks[1];
         if self.list_add_stage > 0 {
-            let labels = ["Destination", "Start date (YYYY-MM-DD)", "End date (YYYY-MM-DD)", "Approved? (y/n)"];
+            let labels = [
+                "Destination",
+                "Start date (YYYY-MM-DD)",
+                "End date (YYYY-MM-DD)",
+                "Approved? (y/n)",
+            ];
             let form_title = if self.list_edit_index.is_some() {
                 "── Edit Vacation ─────────────────────────────────"
             } else {
                 "── Add Vacation ─────────────────────────────────"
             };
-            let mut form_lines: Vec<Line> = vec![
-                Line::from(Span::styled(
-                    form_title,
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-            ];
+            let mut form_lines: Vec<Line> = vec![Line::from(Span::styled(
+                form_title,
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
             for (i, label) in labels.iter().enumerate() {
                 let field_num = (i + 1) as u8;
                 let value = if field_num < self.list_add_stage {
@@ -1240,18 +1384,17 @@ impl<'a> App<'a> {
                 form_lines.push(Line::from(format!("{}: {}", label, value)));
             }
             form_lines.push(Line::from(""));
-            form_lines.push(Line::from(
-                Span::styled("Enter=confirm  Esc=cancel", Style::default().fg(Color::DarkGray)),
-            ));
+            form_lines.push(Line::from(Span::styled(
+                "Enter=confirm  Esc=cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
             let p = Paragraph::new(form_lines).block(Block::default().borders(Borders::NONE));
             f.render_widget(p, bottom);
         } else {
-            let hints = Paragraph::new(vec![
-                Line::from(Span::styled(
-                    "↑↓=move  a=add  Enter/e=edit  Del/x=delete  Esc=back",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
+            let hints = Paragraph::new(vec![Line::from(Span::styled(
+                "↑↓=move  a=add  Enter/e=edit  Del/x=delete  Esc=back",
+                Style::default().fg(Color::DarkGray),
+            ))])
             .block(Block::default().borders(Borders::NONE));
             f.render_widget(hints, bottom);
         }
@@ -1319,24 +1462,34 @@ impl<'a> App<'a> {
                 }
                 KeyCode::Enter => {
                     // Validate date fields (stages 2 and 3)
-                    if self.list_add_stage == 2 || self.list_add_stage == 3 {
-                        if NaiveDate::parse_from_str(&self.input_buffer, "%Y-%m-%d").is_err() {
-                            self.input_buffer = "Invalid date — use YYYY-MM-DD".to_string();
-                            return;
-                        }
+                    if (self.list_add_stage == 2 || self.list_add_stage == 3)
+                        && NaiveDate::parse_from_str(&self.input_buffer, "%Y-%m-%d").is_err()
+                    {
+                        self.input_buffer = "Invalid date — use YYYY-MM-DD".to_string();
+                        return;
                     }
                     self.list_field_bufs.push(self.input_buffer.clone());
 
                     if self.list_add_stage == 4 {
                         // All fields gathered — build vacation
-                        let approved = self.list_field_bufs
+                        let approved = self
+                            .list_field_bufs
                             .get(3)
                             .map(|s| s.to_lowercase().starts_with('y'))
                             .unwrap_or(false);
                         let v = Vacation::new(
-                            self.list_field_bufs.get(0).map(String::as_str).unwrap_or(""),
-                            self.list_field_bufs.get(1).map(String::as_str).unwrap_or(""),
-                            self.list_field_bufs.get(2).map(String::as_str).unwrap_or(""),
+                            self.list_field_bufs
+                                .first()
+                                .map(String::as_str)
+                                .unwrap_or(""),
+                            self.list_field_bufs
+                                .get(1)
+                                .map(String::as_str)
+                                .unwrap_or(""),
+                            self.list_field_bufs
+                                .get(2)
+                                .map(String::as_str)
+                                .unwrap_or(""),
                             approved,
                         );
                         if let Some(idx) = self.list_edit_index {
@@ -1359,7 +1512,13 @@ impl<'a> App<'a> {
                                 self.input_buffer = match next_stage {
                                     2 => v.start_date.clone(),
                                     3 => v.end_date.clone(),
-                                    4 => if v.approved { "y".to_string() } else { "n".to_string() },
+                                    4 => {
+                                        if v.approved {
+                                            "y".to_string()
+                                        } else {
+                                            "n".to_string()
+                                        }
+                                    }
                                     _ => String::new(),
                                 };
                             } else {
@@ -1449,12 +1608,10 @@ impl<'a> App<'a> {
             } else {
                 "── Add Holiday ──────────────────────────────────"
             };
-            let mut form_lines: Vec<Line> = vec![
-                Line::from(Span::styled(
-                    form_title,
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-            ];
+            let mut form_lines: Vec<Line> = vec![Line::from(Span::styled(
+                form_title,
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
             for (i, label) in labels.iter().enumerate() {
                 let field_num = (i + 1) as u8;
                 let value = if field_num < self.list_add_stage {
@@ -1467,18 +1624,17 @@ impl<'a> App<'a> {
                 form_lines.push(Line::from(format!("{}: {}", label, value)));
             }
             form_lines.push(Line::from(""));
-            form_lines.push(Line::from(
-                Span::styled("Enter=confirm  Esc=cancel", Style::default().fg(Color::DarkGray)),
-            ));
+            form_lines.push(Line::from(Span::styled(
+                "Enter=confirm  Esc=cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
             let p = Paragraph::new(form_lines).block(Block::default().borders(Borders::NONE));
             f.render_widget(p, bottom);
         } else {
-            let hints = Paragraph::new(vec![
-                Line::from(Span::styled(
-                    "↑↓=move  a=add  Enter/e=edit  Del/x=delete  Esc=back",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
+            let hints = Paragraph::new(vec![Line::from(Span::styled(
+                "↑↓=move  a=add  Enter/e=edit  Del/x=delete  Esc=back",
+                Style::default().fg(Color::DarkGray),
+            ))])
             .block(Block::default().borders(Borders::NONE));
             f.render_widget(hints, bottom);
         }
@@ -1545,19 +1701,25 @@ impl<'a> App<'a> {
                 }
                 KeyCode::Enter => {
                     // Validate date for stage 1 (date field)
-                    if self.list_add_stage == 1 {
-                        if NaiveDate::parse_from_str(&self.input_buffer, "%Y-%m-%d").is_err() {
-                            self.input_buffer = "Invalid date — use YYYY-MM-DD".to_string();
-                            return;
-                        }
+                    if self.list_add_stage == 1
+                        && NaiveDate::parse_from_str(&self.input_buffer, "%Y-%m-%d").is_err()
+                    {
+                        self.input_buffer = "Invalid date — use YYYY-MM-DD".to_string();
+                        return;
                     }
                     self.list_field_bufs.push(self.input_buffer.clone());
 
                     if self.list_add_stage == 2 {
                         // field_bufs: [0]=date, [1]=name
                         let h = Holiday::new(
-                            self.list_field_bufs.get(1).map(String::as_str).unwrap_or(""),
-                            self.list_field_bufs.get(0).map(String::as_str).unwrap_or(""),
+                            self.list_field_bufs
+                                .get(1)
+                                .map(String::as_str)
+                                .unwrap_or(""),
+                            self.list_field_bufs
+                                .first()
+                                .map(String::as_str)
+                                .unwrap_or(""),
                         );
                         if let Some(idx) = self.list_edit_index {
                             if idx < self.holiday_data.holidays.len() {
@@ -1625,32 +1787,26 @@ impl<'a> App<'a> {
                 } else {
                     current_val.to_string()
                 };
-                Row::new(vec![
-                    Cell::from(format!("  {}", label)),
-                    Cell::from(value),
-                ])
+                Row::new(vec![Cell::from(format!("  {}", label)), Cell::from(value)])
             })
             .collect();
 
         let mut table_state = TableState::default();
         table_state.select(Some(self.list_cursor));
 
-        let table = Table::new(
-            rows,
-            [Constraint::Length(22), Constraint::Min(30)],
-        )
-        .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Settings  (↑↓=select  Enter/e=edit  Esc=back) "),
-        )
-        .row_highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
+        let table = Table::new(rows, [Constraint::Length(22), Constraint::Min(30)])
+            .header(header)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Settings  (↑↓=select  Enter/e=edit  Esc=back) "),
+            )
+            .row_highlight_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            );
 
         f.render_stateful_widget(table, chunks[0], &mut table_state);
 
@@ -1726,8 +1882,11 @@ impl<'a> App<'a> {
 /// A section header row with a dark background and bold text.
 fn section_header(title: &str) -> Row<'static> {
     Row::new(vec![
-        Cell::from(title.to_string())
-            .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Cell::from(title.to_string()).style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Cell::from(""),
         Cell::from(""),
     ])
@@ -1740,16 +1899,8 @@ fn spacer() -> Row<'static> {
 }
 
 /// A data row with a two-space indent on the metric label.
-fn data_row(
-    metric: impl Into<String>,
-    value: Cell<'static>,
-    pct: Cell<'static>,
-) -> Row<'static> {
-    Row::new(vec![
-        Cell::from(format!("  {}", metric.into())),
-        value,
-        pct,
-    ])
+fn data_row(metric: impl Into<String>, value: Cell<'static>, pct: Cell<'static>) -> Row<'static> {
+    Row::new(vec![Cell::from(format!("  {}", metric.into())), value, pct])
 }
 
 /// Plain (unstyled) cell.
@@ -1757,22 +1908,16 @@ fn plain(s: impl Into<String>) -> Cell<'static> {
     Cell::from(s.into())
 }
 
-/// Colored cell.
-fn colored(s: impl Into<String>, color: Color) -> Cell<'static> {
-    Cell::from(s.into()).style(Style::default().fg(color))
-}
-
 // ── App event loop ────────────────────────────────────────────────────────────
 
 pub fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|f| app.render(f))?;
-        if event::poll(StdDuration::from_millis(16))? {
-            if let CEvent::Key(key) = event::read()? {
-                if app.handle_key(key.code, key.modifiers) {
-                    break;
-                }
-            }
+        if event::poll(StdDuration::from_millis(16))?
+            && let CEvent::Key(key) = event::read()?
+            && app.handle_key(key.code, key.modifiers)
+        {
+            break;
         }
     }
     Ok(())
@@ -1874,16 +2019,17 @@ pub(crate) fn search_events<'a>(events: &'a [Event], query: &str) -> Vec<&'a Eve
     let q = query.to_lowercase();
     events
         .iter()
-        .filter(|e| {
-            e.description.to_lowercase().contains(&q) || e.date.contains(query)
-        })
+        .filter(|e| e.description.to_lowercase().contains(&q) || e.date.contains(query))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{AppSettings, BadgeEntryData, EventData, HolidayData, QuarterData, VacationData};
+    use crate::data::time_period::TimePeriod;
+    use crate::data::{
+        AppSettings, BadgeEntryData, EventData, HolidayData, TimePeriodData, VacationData,
+    };
     use chrono::NaiveDate;
     use crossterm::event::{KeyCode, KeyModifiers};
     use std::path::PathBuf;
@@ -1892,36 +2038,33 @@ mod tests {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
     }
 
-    /// Build a QuarterData with two adjacent quarters for navigation tests.
-    fn make_quarter_data() -> QuarterData {
-        use crate::data::quarter::QuarterConfig;
-        let mut q1 = QuarterConfig {
+    fn make_quarter_data() -> TimePeriodData {
+        let mut q1 = TimePeriod {
             key: "Q1_2025".to_string(),
-            quarter: "Q1".to_string(),
-            year: "2025".to_string(),
+            name: "Q1".to_string(),
             start_date_raw: "2025-01-01".to_string(),
             end_date_raw: "2025-03-31".to_string(),
             start_date: None,
             end_date: None,
         };
         q1.parse_dates().unwrap();
-        let mut q2 = QuarterConfig {
+        let mut q2 = TimePeriod {
             key: "Q2_2025".to_string(),
-            quarter: "Q2".to_string(),
-            year: "2025".to_string(),
+            name: "Q2".to_string(),
             start_date_raw: "2025-04-01".to_string(),
             end_date_raw: "2025-06-30".to_string(),
             start_date: None,
             end_date: None,
         };
         q2.parse_dates().unwrap();
-        QuarterData {
-            quarters: vec![q1, q2],
-        }
+        let mut data = TimePeriodData::new();
+        data.add(q1);
+        data.add(q2);
+        data
     }
 
     fn make_test_app<'a>(
-        quarter_data: &'a QuarterData,
+        time_period_data: TimePeriodData,
         badge_data: &'a mut BadgeEntryData,
         holiday_data: &'a mut HolidayData,
         vacation_data: &'a mut VacationData,
@@ -1929,7 +2072,7 @@ mod tests {
         today: NaiveDate,
     ) -> App<'a> {
         App::new(
-            quarter_data,
+            time_period_data,
             badge_data,
             holiday_data,
             vacation_data,
@@ -1945,25 +2088,49 @@ mod tests {
     #[test]
     fn test_style_selected_badged_office() {
         let s = calendar_day_style(true, true, false, false, false, false, false);
-        assert_eq!(s, Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD));
+        assert_eq!(
+            s,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        );
     }
 
     #[test]
     fn test_style_selected_badged_flex() {
         let s = calendar_day_style(true, true, true, false, false, false, false);
-        assert_eq!(s, Style::default().fg(Color::Black).bg(FLEX_COLOR).add_modifier(Modifier::BOLD));
+        assert_eq!(
+            s,
+            Style::default()
+                .fg(Color::Black)
+                .bg(FLEX_COLOR)
+                .add_modifier(Modifier::BOLD)
+        );
     }
 
     #[test]
     fn test_style_selected_holiday() {
         let s = calendar_day_style(true, false, false, true, false, false, false);
-        assert_eq!(s, Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD));
+        assert_eq!(
+            s,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        );
     }
 
     #[test]
     fn test_style_selected_plain() {
         let s = calendar_day_style(true, false, false, false, false, false, false);
-        assert_eq!(s, Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD));
+        assert_eq!(
+            s,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -1971,7 +2138,9 @@ mod tests {
         let s = calendar_day_style(false, true, false, false, false, false, false);
         assert_eq!(
             s,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         );
     }
 
@@ -1980,7 +2149,9 @@ mod tests {
         let s = calendar_day_style(false, true, true, false, false, false, false);
         assert_eq!(
             s,
-            Style::default().fg(FLEX_COLOR).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            Style::default()
+                .fg(FLEX_COLOR)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         );
     }
 
@@ -2004,7 +2175,10 @@ mod tests {
     #[test]
     fn test_style_today_plain() {
         let s = calendar_day_style(false, false, false, false, true, false, false);
-        assert_eq!(s, Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
+        assert_eq!(
+            s,
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -2028,7 +2202,10 @@ mod tests {
     // ── search_events tests ───────────────────────────────────────────────────
 
     fn ev(date: &str, desc: &str) -> Event {
-        Event { date: date.to_string(), description: desc.to_string() }
+        Event {
+            date: date.to_string(),
+            description: desc.to_string(),
+        }
     }
 
     #[test]
@@ -2055,7 +2232,10 @@ mod tests {
 
     #[test]
     fn test_search_partial_match() {
-        let events = vec![ev("2025-01-01", "Team Lunch"), ev("2025-01-02", "Team Meeting")];
+        let events = vec![
+            ev("2025-01-01", "Team Lunch"),
+            ev("2025-01-02", "Team Meeting"),
+        ];
         let result = search_events(&events, "team");
         assert_eq!(result.len(), 2);
     }
@@ -2148,7 +2328,7 @@ mod tests {
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         app.handle_key(KeyCode::Right, KeyModifiers::empty());
         assert_eq!(app.selected_date, d(2025, 2, 11));
@@ -2164,22 +2344,22 @@ mod tests {
     }
 
     #[test]
-    fn test_space_toggles_office_badge() {
+    fn test_b_toggles_office_badge() {
         let qd = make_quarter_data();
         let mut bd = BadgeEntryData::default();
         let mut hd = HolidayData::default();
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         let key = today.format("%Y-%m-%d").to_string();
         assert!(!app.badge_data.has(&key));
 
-        app.handle_key(KeyCode::Char(' '), KeyModifiers::empty());
+        app.handle_key(KeyCode::Char('b'), KeyModifiers::empty());
         assert!(app.badge_data.has(&key));
 
-        app.handle_key(KeyCode::Char(' '), KeyModifiers::empty());
+        app.handle_key(KeyCode::Char('b'), KeyModifiers::empty());
         assert!(!app.badge_data.has(&key));
     }
 
@@ -2191,7 +2371,7 @@ mod tests {
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         let key = today.format("%Y-%m-%d").to_string();
         app.handle_key(KeyCode::Char('f'), KeyModifiers::empty());
@@ -2201,16 +2381,16 @@ mod tests {
     }
 
     #[test]
-    fn test_space_does_nothing_outside_quarter() {
-        let qd = QuarterData::default(); // no quarters
+    fn test_b_does_nothing_outside_quarter() {
+        let qd = TimePeriodData::new();
         let mut bd = BadgeEntryData::default();
         let mut hd = HolidayData::default();
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
-        app.handle_key(KeyCode::Char(' '), KeyModifiers::empty());
+        app.handle_key(KeyCode::Char('b'), KeyModifiers::empty());
         assert_eq!(app.badge_data.data.len(), 0);
     }
 
@@ -2222,7 +2402,7 @@ mod tests {
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         app.handle_key(KeyCode::Char('a'), KeyModifiers::empty());
         app.handle_key(KeyCode::Char('T'), KeyModifiers::empty());
@@ -2244,7 +2424,7 @@ mod tests {
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         app.handle_key(KeyCode::Char('a'), KeyModifiers::empty());
         app.handle_key(KeyCode::Char('x'), KeyModifiers::empty());
@@ -2261,7 +2441,7 @@ mod tests {
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         app.handle_key(KeyCode::Char('a'), KeyModifiers::empty());
         app.handle_key(KeyCode::Enter, KeyModifiers::empty());
@@ -2277,7 +2457,7 @@ mod tests {
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         app.handle_key(KeyCode::Char('a'), KeyModifiers::empty());
         app.handle_key(KeyCode::Char('x'), KeyModifiers::empty());
@@ -2295,9 +2475,12 @@ mod tests {
         let mut hd = HolidayData::default();
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
-        ed.add(Event { date: "2025-02-10".to_string(), description: "To remove".to_string() });
+        ed.add(Event {
+            date: "2025-02-10".to_string(),
+            description: "To remove".to_string(),
+        });
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         app.handle_key(KeyCode::Char('d'), KeyModifiers::empty());
         app.handle_key(KeyCode::Enter, KeyModifiers::empty());
@@ -2312,10 +2495,16 @@ mod tests {
         let mut hd = HolidayData::default();
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
-        ed.add(Event { date: "2025-02-10".to_string(), description: "First".to_string() });
-        ed.add(Event { date: "2025-02-10".to_string(), description: "Second".to_string() });
+        ed.add(Event {
+            date: "2025-02-10".to_string(),
+            description: "First".to_string(),
+        });
+        ed.add(Event {
+            date: "2025-02-10".to_string(),
+            description: "Second".to_string(),
+        });
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         app.handle_key(KeyCode::Char('d'), KeyModifiers::empty());
         assert_eq!(app.cursor_index, 0);
@@ -2335,7 +2524,7 @@ mod tests {
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         app.handle_key(KeyCode::Char('s'), KeyModifiers::empty());
         app.handle_key(KeyCode::Char('q'), KeyModifiers::empty());
@@ -2352,14 +2541,14 @@ mod tests {
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         assert!(!app.is_what_if());
 
         // Enter what-if, add a badge
         app.handle_key(KeyCode::Char('w'), KeyModifiers::empty());
         assert!(app.is_what_if());
-        app.handle_key(KeyCode::Char(' '), KeyModifiers::empty());
+        app.handle_key(KeyCode::Char('b'), KeyModifiers::empty());
         assert_eq!(app.badge_data.data.len(), 1);
 
         // Exit what-if — badge changes discarded
@@ -2376,11 +2565,17 @@ mod tests {
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
-        assert_eq!(app.current_quarter.map(|q| q.key.as_str()), Some("Q1_2025"));
+        assert_eq!(
+            app.current_period().map(|q| q.key.as_str()),
+            Some("Q1_2025")
+        );
         app.handle_key(KeyCode::Char('n'), KeyModifiers::empty());
-        assert_eq!(app.current_quarter.map(|q| q.key.as_str()), Some("Q2_2025"));
+        assert_eq!(
+            app.current_period().map(|q| q.key.as_str()),
+            Some("Q2_2025")
+        );
     }
 
     #[test]
@@ -2392,11 +2587,17 @@ mod tests {
         let mut ed = EventData::default();
         // Start in Q2
         let today = d(2025, 5, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
-        assert_eq!(app.current_quarter.map(|q| q.key.as_str()), Some("Q2_2025"));
+        assert_eq!(
+            app.current_period().map(|q| q.key.as_str()),
+            Some("Q2_2025")
+        );
         app.handle_key(KeyCode::Char('p'), KeyModifiers::empty());
-        assert_eq!(app.current_quarter.map(|q| q.key.as_str()), Some("Q1_2025"));
+        assert_eq!(
+            app.current_period().map(|q| q.key.as_str()),
+            Some("Q1_2025")
+        );
     }
 
     #[test]
@@ -2407,7 +2608,7 @@ mod tests {
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         let quit = app.handle_key(KeyCode::Char('q'), KeyModifiers::empty());
         assert!(quit);
@@ -2421,7 +2622,7 @@ mod tests {
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         let quit = app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(quit);
@@ -2437,11 +2638,11 @@ mod tests {
         let today = d(2025, 2, 10);
         // Pre-badge a date
         bd.add(BadgeEntry::new(today, "McLean, VA", false));
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         // Enter what-if, remove the badge
         app.handle_key(KeyCode::Char('w'), KeyModifiers::empty());
-        app.handle_key(KeyCode::Char(' '), KeyModifiers::empty()); // toggle off
+        app.handle_key(KeyCode::Char('b'), KeyModifiers::empty()); // toggle off
         assert_eq!(app.badge_data.data.len(), 0);
 
         // Quit — should restore original data
@@ -2451,51 +2652,49 @@ mod tests {
     }
 
     #[test]
-    fn test_n_past_last_quarter_then_p_returns() {
+    fn test_n_at_last_quarter_stays() {
         // make_quarter_data has Q1 (Jan-Mar) and Q2 (Apr-Jun) 2025 only.
-        // Navigate past Q2 with n, verify None, then press p to come back.
+        // At last quarter, n keeps us there (Go behavior: adjacent in list).
         let qd = make_quarter_data();
         let mut bd = BadgeEntryData::default();
         let mut hd = HolidayData::default();
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 5, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
-        assert_eq!(app.current_quarter.map(|q| q.key.as_str()), Some("Q2_2025"));
-        // Navigate past the last configured quarter
-        app.handle_key(KeyCode::Char('n'), KeyModifiers::empty());
-        assert!(app.current_quarter.is_none(), "should be None past last quarter");
-        // Navigate back — must work even though current_quarter was None
-        app.handle_key(KeyCode::Char('p'), KeyModifiers::empty());
         assert_eq!(
-            app.current_quarter.map(|q| q.key.as_str()),
+            app.current_period().map(|q| q.key.as_str()),
+            Some("Q2_2025")
+        );
+        app.handle_key(KeyCode::Char('n'), KeyModifiers::empty());
+        assert_eq!(
+            app.current_period().map(|q| q.key.as_str()),
             Some("Q2_2025"),
-            "should return to Q2 after pressing p"
+            "n at last quarter keeps us there"
         );
     }
 
     #[test]
-    fn test_p_past_first_quarter_then_n_returns() {
-        // Navigate before Q1 with p, verify None, then press n to come back.
+    fn test_p_at_first_quarter_stays() {
+        // At first quarter, p keeps us there (Go behavior: adjacent in list).
         let qd = make_quarter_data();
         let mut bd = BadgeEntryData::default();
         let mut hd = HolidayData::default();
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
-        assert_eq!(app.current_quarter.map(|q| q.key.as_str()), Some("Q1_2025"));
-        // Navigate before the first configured quarter
-        app.handle_key(KeyCode::Char('p'), KeyModifiers::empty());
-        assert!(app.current_quarter.is_none(), "should be None before first quarter");
-        // Navigate forward — must work even though current_quarter was None
-        app.handle_key(KeyCode::Char('n'), KeyModifiers::empty());
         assert_eq!(
-            app.current_quarter.map(|q| q.key.as_str()),
+            app.current_period().map(|q| q.key.as_str()),
+            Some("Q1_2025")
+        );
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::empty());
+        assert_eq!(
+            app.current_period().map(|q| q.key.as_str()),
             Some("Q1_2025"),
-            "should return to Q1 after pressing n"
+            "p at first quarter keeps us there"
         );
     }
 
@@ -2507,24 +2706,25 @@ mod tests {
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 2, 10);
-        let app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
         assert!(app.year_stats.is_some(), "year_stats should be populated");
     }
 
     #[test]
     fn test_year_stats_cleared_when_no_quarter() {
-        let qd = make_quarter_data();
+        let qd = TimePeriodData::new();
         let mut bd = BadgeEntryData::default();
         let mut hd = HolidayData::default();
         let mut vd = VacationData::default();
         let mut ed = EventData::default();
         let today = d(2025, 5, 10);
-        let mut app = make_test_app(&qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+        let app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
 
-        // Navigate past last quarter
-        app.handle_key(KeyCode::Char('n'), KeyModifiers::empty());
-        assert!(app.current_quarter.is_none());
-        assert!(app.year_stats.is_none(), "year_stats should be None when no quarter");
+        assert!(app.current_period().is_none());
+        assert!(
+            app.year_stats.is_none(),
+            "year_stats should be None when no quarter"
+        );
     }
 }
