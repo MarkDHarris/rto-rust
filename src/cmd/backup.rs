@@ -324,8 +324,8 @@ mod tests {
         }
         let dir = tempfile::TempDir::new().unwrap();
         let remote_dir = tempfile::TempDir::new().unwrap();
-        let _ = run_git_silent(remote_dir.path(), &["init", "--bare"]);
-        let _ = run_git_silent(dir.path(), &["init"]);
+        let _ = run_git_silent(remote_dir.path(), &["init", "--bare", "-b", "main"]);
+        let _ = run_git_silent(dir.path(), &["init", "-b", "main"]);
         set_git_identity(dir.path());
         fs::write(dir.path().join("data.txt"), "backup").unwrap();
 
