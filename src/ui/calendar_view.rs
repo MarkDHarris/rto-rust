@@ -1,7 +1,7 @@
 use crate::calc::{QuarterStats, calculate_quarter_stats, calculate_year_stats};
 use crate::data::{
-    AppSettings, BadgeEntry, BadgeEntryData, Event, EventData, Holiday, HolidayData, TimePeriod,
-    TimePeriodData, Vacation, VacationData,
+    AppSettings, BadgeEntry, BadgeEntryData, Event, EventData, Holiday, HolidayData, Persistable,
+    TimePeriod, TimePeriodData, Vacation, VacationData,
 };
 use anyhow::Result;
 use chrono::{Datelike, Duration, Local, NaiveDate};
@@ -59,6 +59,7 @@ pub struct App<'a> {
     table_state: TableState,
     pub settings: AppSettings,
     what_if_snapshot: Option<BadgeEntryData>,
+    data_dirty: bool,
     data_dir: PathBuf,
     active_time_period_idx: usize,
     git_status: Option<(String, Color)>,
@@ -105,6 +106,7 @@ impl<'a> App<'a> {
             table_state: TableState::default(),
             settings,
             what_if_snapshot: None,
+            data_dirty: false,
             data_dir,
             active_time_period_idx: 0,
             git_status: None,
@@ -378,6 +380,8 @@ impl<'a> App<'a> {
                                 description: self.input_buffer.clone(),
                             };
                             self.event_data.add(event);
+                            self.data_dirty = true;
+                            let _ = self.event_data.save_to(&self.data_dir);
                         }
                         self.input_buffer.clear();
                         self.mode = Mode::Normal;
@@ -411,6 +415,8 @@ impl<'a> App<'a> {
                         if !events.is_empty() && self.cursor_index < events.len() {
                             let desc = events[self.cursor_index].description.clone();
                             self.event_data.remove(&date_key, &desc);
+                            self.data_dirty = true;
+                            let _ = self.event_data.save_to(&self.data_dir);
                             let new_len = events.len() - 1;
                             if self.cursor_index > 0 && self.cursor_index >= new_len {
                                 self.cursor_index -= 1;
@@ -494,6 +500,10 @@ impl<'a> App<'a> {
                                 let entry = BadgeEntry::new(self.selected_date, &office, false);
                                 self.badge_data.add(entry);
                             }
+                            if !self.is_what_if() {
+                                self.data_dirty = true;
+                                let _ = self.badge_data.save_to(&self.data_dir);
+                            }
                             self.update_stats();
                         }
                     }
@@ -506,6 +516,10 @@ impl<'a> App<'a> {
                                 let flex = self.settings.flex_credit.clone();
                                 let entry = BadgeEntry::new(self.selected_date, &flex, true);
                                 self.badge_data.add(entry);
+                            }
+                            if !self.is_what_if() {
+                                self.data_dirty = true;
+                                let _ = self.badge_data.save_to(&self.data_dir);
                             }
                             self.update_stats();
                         }
@@ -1250,6 +1264,9 @@ impl<'a> App<'a> {
         if git_info.is_repo {
             let mut parts: Vec<Span> = vec![Span::styled("  Git: ", help_style)];
             let mut status_parts: Vec<String> = Vec::new();
+            if self.data_dirty {
+                status_parts.push("unsaved changes".to_string());
+            }
             if git_info.modified > 0 {
                 status_parts.push(format!("{} modified", git_info.modified));
             }
@@ -1271,7 +1288,7 @@ impl<'a> App<'a> {
             if git_info.has_remote {
                 parts.push(Span::styled("  (remote: origin)", help_style));
             }
-            if git_info.modified > 0 || git_info.untracked > 0 {
+            if self.data_dirty || git_info.modified > 0 || git_info.untracked > 0 {
                 parts.push(Span::styled("  [press g to backup]", help_style));
             }
             lines.push(Line::from(parts));
@@ -1434,11 +1451,12 @@ impl<'a> App<'a> {
                     }
                 }
                 KeyCode::Delete | KeyCode::Char('x') => {
-                    // Only Delete and x delete; Enter now edits
                     if !self.vacation_data.vacations.is_empty()
                         && self.list_cursor < self.vacation_data.vacations.len()
                     {
                         self.vacation_data.vacations.remove(self.list_cursor);
+                        self.data_dirty = true;
+                        let _ = self.vacation_data.save_to(&self.data_dir);
                         if self.list_cursor > 0
                             && self.list_cursor >= self.vacation_data.vacations.len()
                         {
@@ -1493,13 +1511,14 @@ impl<'a> App<'a> {
                             approved,
                         );
                         if let Some(idx) = self.list_edit_index {
-                            // Edit: replace in-place
                             if idx < self.vacation_data.vacations.len() {
                                 self.vacation_data.vacations[idx] = v;
                             }
                         } else {
                             self.vacation_data.add(v);
                         }
+                        self.data_dirty = true;
+                        let _ = self.vacation_data.save_to(&self.data_dir);
                         self.list_add_stage = 0;
                         self.list_edit_index = None;
                         self.list_field_bufs.clear();
@@ -1678,6 +1697,8 @@ impl<'a> App<'a> {
                         && self.list_cursor < self.holiday_data.holidays.len()
                     {
                         self.holiday_data.holidays.remove(self.list_cursor);
+                        self.data_dirty = true;
+                        let _ = self.holiday_data.save_to(&self.data_dir);
                         if self.list_cursor > 0
                             && self.list_cursor >= self.holiday_data.holidays.len()
                         {
@@ -1728,6 +1749,8 @@ impl<'a> App<'a> {
                         } else {
                             self.holiday_data.add(h);
                         }
+                        self.data_dirty = true;
+                        let _ = self.holiday_data.save_to(&self.data_dir);
                         self.list_add_stage = 0;
                         self.list_edit_index = None;
                         self.list_field_bufs.clear();
@@ -1864,6 +1887,8 @@ impl<'a> App<'a> {
                         0 => self.settings.default_office = value,
                         _ => self.settings.flex_credit = value,
                     }
+                    self.data_dirty = true;
+                    let _ = self.settings.save_to(&self.data_dir);
                     self.input_buffer.clear();
                     self.list_add_stage = 0;
                 }
@@ -2725,6 +2750,56 @@ mod tests {
         assert!(
             app.year_stats.is_none(),
             "year_stats should be None when no quarter"
+        );
+    }
+
+    #[test]
+    fn test_b_sets_data_dirty() {
+        let qd = make_quarter_data();
+        let mut bd = BadgeEntryData::default();
+        let mut hd = HolidayData::default();
+        let mut vd = VacationData::default();
+        let mut ed = EventData::default();
+        let today = d(2025, 2, 10);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+
+        assert!(!app.data_dirty);
+        app.handle_key(KeyCode::Char('b'), KeyModifiers::empty());
+        assert!(app.data_dirty, "data_dirty should be true after badge toggle");
+    }
+
+    #[test]
+    fn test_f_sets_data_dirty() {
+        let qd = make_quarter_data();
+        let mut bd = BadgeEntryData::default();
+        let mut hd = HolidayData::default();
+        let mut vd = VacationData::default();
+        let mut ed = EventData::default();
+        let today = d(2025, 2, 10);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+
+        assert!(!app.data_dirty);
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::empty());
+        assert!(app.data_dirty, "data_dirty should be true after flex toggle");
+    }
+
+    #[test]
+    fn test_what_if_badge_does_not_set_dirty() {
+        let qd = make_quarter_data();
+        let mut bd = BadgeEntryData::default();
+        let mut hd = HolidayData::default();
+        let mut vd = VacationData::default();
+        let mut ed = EventData::default();
+        let today = d(2025, 2, 10);
+        let mut app = make_test_app(qd, &mut bd, &mut hd, &mut vd, &mut ed, today);
+
+        app.handle_key(KeyCode::Char('w'), KeyModifiers::empty());
+        assert!(app.is_what_if());
+
+        app.handle_key(KeyCode::Char('b'), KeyModifiers::empty());
+        assert!(
+            !app.data_dirty,
+            "data_dirty should remain false in what-if mode"
         );
     }
 }
